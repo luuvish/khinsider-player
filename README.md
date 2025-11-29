@@ -27,6 +27,11 @@ cd khinsider-player
 npm install
 ```
 
+3. Build the project:
+```bash
+npm run build
+```
+
 ## Usage
 
 Start the player:
@@ -38,6 +43,17 @@ For development with auto-restart:
 ```bash
 npm run dev
 ```
+
+## Scripts
+
+| Command | Description |
+|---------|-------------|
+| `npm start` | Run the application |
+| `npm run dev` | Run with auto-restart on file changes |
+| `npm run build` | Build TypeScript to JavaScript |
+| `npm run typecheck` | Run TypeScript type checking |
+| `npm run lint` | Run ESLint |
+| `npm run lint:fix` | Run ESLint with auto-fix |
 
 ## Keyboard Shortcuts
 
@@ -87,40 +103,62 @@ Note: Bulk download requires a khinsider.com account. Login credentials are save
 
 ```
 src/
-├── index.js                 # Main entry point
-├── scraper.js               # Web scraping & API client
+├── index.ts                 # Main entry point
+├── scraper.ts               # Web scraping & API client
+├── constants.ts             # Application constants
+├── types/
+│   ├── index.ts             # Type exports
+│   ├── models.ts            # Data models & interfaces
+│   └── blessed.d.ts         # Blessed type definitions
 ├── data/
-│   ├── database.js          # SQLite database setup
+│   ├── database.ts          # SQLite database setup
 │   └── repositories/        # Data access layer
-│       ├── album-repo.js
-│       ├── track-repo.js
-│       ├── settings-repo.js
-│       ├── history-repo.js
-│       └── playback-repo.js
+│       ├── album-repo.ts
+│       ├── track-repo.ts
+│       ├── settings-repo.ts
+│       ├── history-repo.ts
+│       └── playback-repo.ts
 ├── storage/
-│   ├── manager.js           # Download directory management
-│   └── downloader.js        # Album download handler
+│   ├── manager.ts           # Download directory management
+│   ├── downloader.ts        # Album download handler
+│   └── index.ts
 ├── playback/
-│   ├── player.js            # Audio player (mpv)
-│   └── controller.js        # Playback state management
-└── tui/
-    ├── App.js               # Main application
-    ├── panels/
-    │   ├── NavigationPanel.js
-    │   ├── FavoritesPanel.js
-    │   ├── NowPlayingPanel.js
-    │   ├── HistoryPanel.js
-    │   ├── StatusBar.js
-    │   └── TitleBar.js
-    └── utils/
-        ├── keyBindings.js
-        └── formatters.js
+│   ├── player.ts            # Audio player (afplay/mpg123/PowerShell)
+│   ├── controller.ts        # Playback state management
+│   └── index.ts
+├── tui/
+│   ├── App.ts               # Main application
+│   ├── index.ts
+│   ├── panels/
+│   │   ├── NavigationPanel.ts
+│   │   ├── FavoritesPanel.ts
+│   │   ├── NowPlayingPanel.ts
+│   │   ├── HistoryPanel.ts
+│   │   ├── StatusBar.ts
+│   │   └── TitleBar.ts
+│   └── utils/
+│       ├── keyBindings.ts
+│       ├── formatters.ts
+│       └── loginForm.ts
+└── utils/
+    └── index.ts             # Utility functions
 ```
 
 ## Data Storage
 
 - **Database**: `data/khinsider.db` (SQLite)
 - **Downloads**: `downloads/` directory
+
+## Tech Stack
+
+- **Language**: TypeScript 5.x
+- **Runtime**: Node.js 18+
+- **UI**: Blessed (terminal UI)
+- **Database**: SQLite (better-sqlite3)
+- **HTTP**: Axios with cookie support
+- **Scraping**: Cheerio
+- **Build**: tsup
+- **Linting**: ESLint with TypeScript support
 
 ## Requirements
 
@@ -147,3 +185,7 @@ Arch:
 ```bash
 sudo pacman -S mpg123
 ```
+
+## License
+
+MIT
