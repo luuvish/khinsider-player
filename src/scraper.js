@@ -3,6 +3,18 @@ import * as cheerio from 'cheerio';
 import { wrapper } from 'axios-cookiejar-support';
 import { CookieJar } from 'tough-cookie';
 
+// Rate limiting configuration
+const RATE_LIMIT_DELAY = 500; // 500ms between requests
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 2000; // 2 seconds between retries
+
+// Allowed domains for URL validation
+const ALLOWED_DOMAINS = [
+  'downloads.khinsider.com',
+  'khinsider.com',
+  'vgmtreasurechest.com'
+];
+
 class KhinsiderScraper {
   constructor() {
     this.baseUrl = 'https://downloads.khinsider.com';
@@ -17,6 +29,87 @@ class KhinsiderScraper {
     }));
 
     this.isLoggedIn = false;
+
+    // Rate limiting
+    this.lastRequestTime = 0;
+    this._requestLock = null;
+  }
+
+  // Rate limiting helper using mutex pattern (avoids infinite promise chain)
+  async rateLimitedRequest(fn) {
+    // Wait for any pending request to complete
+    while (this._requestLock) {
+      await this._requestLock;
+    }
+
+    // Create a new lock
+    let releaseLock;
+    this._requestLock = new Promise(resolve => { releaseLock = resolve; });
+
+    try {
+      const now = Date.now();
+      const timeSinceLastRequest = now - this.lastRequestTime;
+
+      if (timeSinceLastRequest < RATE_LIMIT_DELAY) {
+        await this.delay(RATE_LIMIT_DELAY - timeSinceLastRequest);
+      }
+
+      this.lastRequestTime = Date.now();
+      return await fn();
+    } finally {
+      // Release lock before nullifying to prevent race condition
+      releaseLock();
+      this._requestLock = null;
+    }
+  }
+
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // Validate URL domain against whitelist
+  validateUrl(url) {
+    try {
+      const parsed = new URL(url);
+      const isAllowed = ALLOWED_DOMAINS.some(domain =>
+        parsed.hostname === domain || parsed.hostname.endsWith('.' + domain)
+      );
+      if (!isAllowed) {
+        throw new Error(`URL domain not allowed: ${parsed.hostname}`);
+      }
+      return url;
+    } catch (error) {
+      if (error.message.includes('not allowed')) {
+        throw error;
+      }
+      throw new Error(`Invalid URL: ${url}`);
+    }
+  }
+
+  // Build and validate full URL from href
+  buildUrl(href) {
+    if (!href) return null;
+    const fullUrl = href.startsWith('http') ? href : this.baseUrl + href;
+    return this.validateUrl(fullUrl);
+  }
+
+  // Validate HTTP response status
+  validateResponse(response, url) {
+    if (response.status >= 400) {
+      throw new Error(`HTTP ${response.status} error for ${url}`);
+    }
+
+    // Check for common error patterns in HTML
+    if (typeof response.data === 'string') {
+      if (response.data.includes('Access Denied') || response.data.includes('403 Forbidden')) {
+        throw new Error('Access denied - you may be rate limited');
+      }
+      if (response.data.includes('404 Not Found') || response.data.includes('Page not found')) {
+        throw new Error('Page not found');
+      }
+    }
+
+    return response;
   }
 
   async makeRequest(url, options = {}) {
@@ -31,10 +124,35 @@ class KhinsiderScraper {
       'Referer': this.baseUrl
     };
 
-    return await this.client.get(url, {
-      headers: { ...defaultHeaders, ...options.headers },
-      timeout: 30000,
-      ...options
+    return this.rateLimitedRequest(async () => {
+      let lastError;
+
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+          const response = await this.client.get(url, {
+            headers: { ...defaultHeaders, ...options.headers },
+            timeout: 30000,
+            validateStatus: () => true, // Don't throw on HTTP errors
+            ...options
+          });
+
+          return this.validateResponse(response, url);
+        } catch (error) {
+          lastError = error;
+
+          // Don't retry on client errors (4xx except 429)
+          if (error.response?.status >= 400 && error.response?.status < 500 && error.response?.status !== 429) {
+            throw error;
+          }
+
+          // Wait before retry (with exponential backoff)
+          if (attempt < MAX_RETRIES - 1) {
+            await this.delay(RETRY_DELAY * (attempt + 1));
+          }
+        }
+      }
+
+      throw lastError;
     });
   }
 
@@ -47,11 +165,42 @@ class KhinsiderScraper {
       'Referer': this.forumUrl + '/index.php?login/'
     };
 
-    return await this.client.post(url, data, {
-      headers: { ...defaultHeaders, ...options.headers },
-      timeout: 30000,
-      maxRedirects: 5,
-      ...options
+    return this.rateLimitedRequest(async () => {
+      const response = await this.client.post(url, data, {
+        headers: { ...defaultHeaders, ...options.headers },
+        timeout: 30000,
+        maxRedirects: 5,
+        validateStatus: () => true,
+        ...options
+      });
+
+      return this.validateResponse(response, url);
+    });
+  }
+
+  // Rate-limited streaming request for file downloads
+  async makeStreamRequest(url, options = {}) {
+    const defaultHeaders = {
+      'User-Agent': this.userAgent,
+      'Accept': '*/*',
+      'Referer': this.baseUrl
+    };
+
+    return this.rateLimitedRequest(async () => {
+      const response = await this.client({
+        method: 'GET',
+        url: url,
+        responseType: 'stream',
+        headers: { ...defaultHeaders, ...options.headers },
+        timeout: options.timeout || 60000,
+        ...options
+      });
+
+      if (response.status >= 400) {
+        throw new Error(`HTTP ${response.status} error for ${url}`);
+      }
+
+      return response;
     });
   }
 
@@ -140,8 +289,11 @@ class KhinsiderScraper {
           return match[1];
         }
       }
+      // No bulk download link found (normal for some albums)
       return null;
-    } catch {
+    } catch (error) {
+      // Log network/parsing errors for debugging
+      console.error(`getAlbumDownloadId error for ${albumUrl}:`, error.message);
       return null;
     }
   }
@@ -161,12 +313,15 @@ class KhinsiderScraper {
 
         if (!href) return;
 
-        const fullUrl = href.startsWith('http') ? href : this.baseUrl + href;
-
-        if (text.includes('flac') || href.includes('flac')) {
-          urls.flacUrl = fullUrl;
-        } else if (text.includes('mp3') || href.includes('mp3')) {
-          urls.mp3Url = fullUrl;
+        try {
+          const fullUrl = this.buildUrl(href);
+          if (text.includes('flac') || href.includes('flac')) {
+            urls.flacUrl = fullUrl;
+          } else if (text.includes('mp3') || href.includes('mp3')) {
+            urls.mp3Url = fullUrl;
+          }
+        } catch {
+          // Skip invalid URLs
         }
       });
 
@@ -174,7 +329,7 @@ class KhinsiderScraper {
       if (!urls.mp3Url && !urls.flacUrl) {
         const addAlbumLink = $('a[href*="/cp/add_album/"]').attr('href');
         if (addAlbumLink) {
-          const addAlbumUrl = addAlbumLink.startsWith('http') ? addAlbumLink : this.baseUrl + addAlbumLink;
+          const addAlbumUrl = this.buildUrl(addAlbumLink);
 
           // Follow the add_album link to get to download page
           const downloadPageResponse = await this.makeRequest(addAlbumUrl);
@@ -187,15 +342,18 @@ class KhinsiderScraper {
 
             if (!href) return;
 
-            const fullUrl = href.startsWith('http') ? href : this.baseUrl + href;
-
-            if (text.includes('flac') || href.includes('flac')) {
-              urls.flacUrl = fullUrl;
-            } else if (text.includes('mp3') || href.includes('mp3')) {
-              urls.mp3Url = fullUrl;
-            } else if (!urls.mp3Url) {
-              // Fallback: use first zip link as mp3
-              urls.mp3Url = fullUrl;
+            try {
+              const fullUrl = this.buildUrl(href);
+              if (text.includes('flac') || href.includes('flac')) {
+                urls.flacUrl = fullUrl;
+              } else if (text.includes('mp3') || href.includes('mp3')) {
+                urls.mp3Url = fullUrl;
+              } else if (!urls.mp3Url) {
+                // Fallback: use first zip link as mp3
+                urls.mp3Url = fullUrl;
+              }
+            } catch {
+              // Skip invalid URLs
             }
           });
         }
@@ -208,9 +366,25 @@ class KhinsiderScraper {
   }
 
   async searchAlbums(query) {
+    // Validate search query
+    if (!query || typeof query !== 'string') {
+      return [];
+    }
+
+    const trimmedQuery = query.trim();
+    if (trimmedQuery.length === 0) {
+      return [];
+    }
+
+    // Limit query length to prevent abuse (max 200 chars)
+    const MAX_QUERY_LENGTH = 200;
+    if (trimmedQuery.length > MAX_QUERY_LENGTH) {
+      throw new Error(`Search query too long (max ${MAX_QUERY_LENGTH} characters)`);
+    }
+
     try {
       const response = await this.makeRequest(`${this.baseUrl}/search`, {
-        params: { search: query }
+        params: { search: trimmedQuery }
       });
       
       const $ = cheerio.load(response.data);
@@ -261,6 +435,8 @@ class KhinsiderScraper {
       return albums;
 
     } catch (error) {
+      // Log error for debugging before returning empty results
+      console.error(`Search error for query "${trimmedQuery}":`, error.message);
       return [];
     }
   }
@@ -284,10 +460,14 @@ class KhinsiderScraper {
         if (href) {
           // Only include album art from vgmtreasurechest (actual album images)
           if (href.includes('vgmtreasurechest.com') || href.includes('/soundtracks/')) {
-            const fullUrl = href.startsWith('http') ? href : this.baseUrl + href;
-            // Exclude thumbs
-            if (!fullUrl.includes('/thumbs/')) {
-              imageSet.add(fullUrl);
+            try {
+              const fullUrl = this.buildUrl(href);
+              // Exclude thumbs
+              if (!fullUrl.includes('/thumbs/')) {
+                imageSet.add(fullUrl);
+              }
+            } catch {
+              // Skip invalid URLs
             }
           }
         }
@@ -446,33 +626,45 @@ class KhinsiderScraper {
     try {
       const response = await this.makeRequest(trackPageUrl);
       const $ = cheerio.load(response.data);
-      
+
       // Look for various types of download links
       let mp3Url = null;
       let flacUrl = null;
-      
+
       // Method 1: Look for audio source tags
       const audioSource = $('audio source').attr('src');
       if (audioSource) {
-        mp3Url = audioSource.startsWith('http') ? audioSource : this.baseUrl + audioSource;
+        try {
+          mp3Url = this.buildUrl(audioSource);
+        } catch {
+          // Skip invalid URL
+        }
       }
-      
+
       // Method 2: Look for download links
       if (!mp3Url) {
         const downloadLinks = $('a[href*=".mp3"]');
         if (downloadLinks.length > 0) {
           const href = downloadLinks.first().attr('href');
-          mp3Url = href.startsWith('http') ? href : this.baseUrl + href;
+          try {
+            mp3Url = this.buildUrl(href);
+          } catch {
+            // Skip invalid URL
+          }
         }
       }
-      
+
       // Look for FLAC
       const flacLinks = $('a[href*=".flac"]');
       if (flacLinks.length > 0) {
         const href = flacLinks.first().attr('href');
-        flacUrl = href.startsWith('http') ? href : this.baseUrl + href;
+        try {
+          flacUrl = this.buildUrl(href);
+        } catch {
+          // Skip invalid URL
+        }
       }
-      
+
       return {
         mp3: mp3Url,
         flac: flacUrl

@@ -1,25 +1,24 @@
 import path from 'path';
 import fs from 'fs-extra';
 import { PROJECT_ROOT } from '../data/database.js';
+import { slugify, sanitizeFilename } from '../utils/index.js';
 
 const DOWNLOADS_DIR = path.join(PROJECT_ROOT, 'downloads');
 
-function slugify(text) {
-  return text
-    .toLowerCase()
-    .replace(/[^\w\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .trim()
-    .slice(0, 100);
-}
-
-function sanitizeFilename(name) {
-  return name
-    .replace(/[<>:"/\\|?*]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 200);
+// Validate path component to prevent path traversal attacks
+function validatePathComponent(component, name = 'path component') {
+  if (!component || typeof component !== 'string') {
+    throw new Error(`Invalid ${name}: must be a non-empty string`);
+  }
+  // Block path traversal patterns
+  if (component.includes('..') || component.includes('/') || component.includes('\\')) {
+    throw new Error(`Invalid ${name}: contains path traversal characters`);
+  }
+  // Block null bytes
+  if (component.includes('\0')) {
+    throw new Error(`Invalid ${name}: contains null bytes`);
+  }
+  return component;
 }
 
 export class StorageManager {
@@ -33,6 +32,8 @@ export class StorageManager {
 
   getAlbumPath(year, albumSlug) {
     const yearDir = year || 'unknown';
+    validatePathComponent(yearDir, 'year');
+    validatePathComponent(albumSlug, 'albumSlug');
     return path.join(this.downloadsDir, yearDir, albumSlug);
   }
 
@@ -53,7 +54,10 @@ export class StorageManager {
   }
 
   getZipPath(year, albumSlug) {
-    return path.join(this.downloadsDir, year || 'unknown', `${albumSlug}.zip`);
+    const yearDir = year || 'unknown';
+    validatePathComponent(yearDir, 'year');
+    validatePathComponent(albumSlug, 'albumSlug');
+    return path.join(this.downloadsDir, yearDir, `${albumSlug}.zip`);
   }
 
   getTrackFilename(trackNumber, trackName, extension = 'mp3') {
@@ -74,9 +78,13 @@ export class StorageManager {
   }
 
   async saveMetadata(year, albumSlug, metadata, filename = null) {
-    const metadataPath = filename
-      ? path.join(this.getAlbumPath(year, albumSlug), filename)
-      : this.getMetadataPath(year, albumSlug);
+    let metadataPath;
+    if (filename) {
+      validatePathComponent(filename, 'filename');
+      metadataPath = path.join(this.getAlbumPath(year, albumSlug), filename);
+    } else {
+      metadataPath = this.getMetadataPath(year, albumSlug);
+    }
     await fs.writeJson(metadataPath, metadata, { spaces: 2 });
     return metadataPath;
   }
@@ -84,7 +92,13 @@ export class StorageManager {
   async loadMetadata(year, albumSlug) {
     const metadataPath = this.getMetadataPath(year, albumSlug);
     if (await fs.pathExists(metadataPath)) {
-      return await fs.readJson(metadataPath);
+      try {
+        return await fs.readJson(metadataPath);
+      } catch (error) {
+        // Return null if JSON is malformed
+        console.error(`Failed to parse metadata at ${metadataPath}:`, error.message);
+        return null;
+      }
     }
     return null;
   }
@@ -122,6 +136,7 @@ export class StorageManager {
   }
 
   async getDownloadedAlbums(year) {
+    validatePathComponent(year, 'year');
     const yearPath = path.join(this.downloadsDir, year);
     if (!await fs.pathExists(yearPath)) {
       return [];

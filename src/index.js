@@ -34,6 +34,7 @@ import { albumRepo } from './data/repositories/album-repo.js';
 import { trackRepo } from './data/repositories/track-repo.js';
 import KhinsiderScraper from './scraper.js';
 import { createPlaybackController } from './playback/controller.js';
+import { audioPlayer } from './playback/player.js';
 import { createDownloader } from './storage/downloader.js';
 import { App } from './tui/App.js';
 
@@ -41,6 +42,9 @@ async function main() {
   try {
     // Initialize database
     initializeDatabase();
+
+    // Clean up any leftover temp files from previous crashes (await to prevent race)
+    await audioPlayer.cleanupTempDir();
 
     // Create scraper
     const scraper = new KhinsiderScraper();
@@ -69,8 +73,28 @@ async function main() {
 
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
-    process.on('uncaughtException', () => {
-      shutdown();
+    process.on('uncaughtException', async (error) => {
+      // Log error before shutdown for debugging
+      console.error('Uncaught Exception:', error);
+      try {
+        await playbackController.stop();
+        closeDatabase();
+      } catch {
+        // Ignore cleanup errors
+      }
+      process.exit(1);
+    });
+    process.on('unhandledRejection', async (reason, promise) => {
+      // Log unhandled promise rejections
+      console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+      // Cleanup resources on unhandled rejection
+      try {
+        await playbackController.stop();
+        closeDatabase();
+      } catch {
+        // Ignore cleanup errors
+      }
+      process.exit(1);
     });
 
     // Initialize and run app

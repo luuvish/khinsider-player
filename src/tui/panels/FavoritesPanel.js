@@ -18,6 +18,7 @@ export class FavoritesPanel {
 
     // Group by year
     this.albumsByYear = {};  // year -> albums[]
+    this.sortedYears = [];   // years sorted descending
 
     this.createPanel();
   }
@@ -249,19 +250,12 @@ export class FavoritesPanel {
       this.albumsByYear[year].push(album);
     }
 
-    // Sort years descending
-    const years = Object.keys(this.albumsByYear).sort((a, b) => {
+    // Sort years descending (newest first)
+    this.sortedYears = Object.keys(this.albumsByYear).sort((a, b) => {
       if (a === 'Unknown') return 1;
       if (b === 'Unknown') return -1;
       return b.localeCompare(a);
     });
-
-    // Rebuild with sorted years
-    const sortedAlbumsByYear = {};
-    for (const year of years) {
-      sortedAlbumsByYear[year] = this.albumsByYear[year];
-    }
-    this.albumsByYear = sortedAlbumsByYear;
 
     this.buildItems();
     this.render();
@@ -270,7 +264,7 @@ export class FavoritesPanel {
   buildItems() {
     this.cachedItems = [];
 
-    for (const year of Object.keys(this.albumsByYear)) {
+    for (const year of this.sortedYears) {
       const albums = this.albumsByYear[year];
       const isExpanded = this.expandedYears.has(year);
       const prefix = isExpanded ? '▼' : '▶';

@@ -5,20 +5,12 @@ import { albumRepo } from '../data/repositories/album-repo.js';
 import { trackRepo } from '../data/repositories/track-repo.js';
 import { historyRepo } from '../data/repositories/history-repo.js';
 import { storageManager } from '../storage/manager.js';
+import { PlaybackState, PlaybackMode } from '../constants.js';
 
-export const PlaybackState = {
-  IDLE: 'idle',
-  LOADING: 'loading',
-  PLAYING: 'playing',
-  PAUSED: 'paused',
-  ERROR: 'error'
-};
+export { PlaybackState, PlaybackMode };
 
-export const PlaybackMode = {
-  IDLE: 'idle',
-  ALBUM: 'album',
-  YEAR_SEQUENTIAL: 'year_sequential'
-};
+// Maximum consecutive track failures before stopping playback
+const MAX_SKIP = 10;
 
 export class PlaybackController extends EventEmitter {
   constructor(scraper) {
@@ -35,11 +27,19 @@ export class PlaybackController extends EventEmitter {
     this.currentTracks = [];
     this.currentTrackIndex = 0;
 
+    // Bound listener references for cleanup
+    this._boundListeners = {};
+    this._isStopping = false;
+
+    // Mutex lock for navigation operations
+    this._isAdvancing = false;
+
     this.setupPlayerEvents();
   }
 
   setupPlayerEvents() {
-    audioPlayer.on('play', (data) => {
+    // Store bound listeners for later cleanup
+    this._boundListeners.play = (data) => {
       this.state = PlaybackState.PLAYING;
       this.emit('trackStart', {
         track: data.track,
@@ -47,50 +47,87 @@ export class PlaybackController extends EventEmitter {
         trackIndex: this.currentTrackIndex,
         totalTracks: this.currentTracks.length
       });
-    });
+    };
 
-    audioPlayer.on('ended', async () => {
-      // Record history and mark as completed
-      const track = this.currentTracks[this.currentTrackIndex];
-      if (track) {
-        historyRepo.addTrackPlay(track, this.currentAlbum);
-        // Emit track completed event
-        this.emit('trackCompleted', {
-          track,
-          album: this.currentAlbum
-        });
+    this._boundListeners.ended = async () => {
+      // Check if we're stopping or already advancing - prevent race condition
+      if (this._isStopping || this.state === PlaybackState.IDLE || this._isAdvancing) {
+        return;
       }
 
-      // Auto advance to next track
-      await this.next();
-    });
+      try {
+        // Record history and mark as completed
+        const track = this.currentTracks[this.currentTrackIndex];
+        if (track) {
+          historyRepo.addTrackPlay(track, this.currentAlbum);
+          this.emit('trackCompleted', {
+            track,
+            album: this.currentAlbum
+          });
+        }
 
-    audioPlayer.on('pause', () => {
+        // Auto advance to next track with mutex (call playTrackByIndex directly)
+        if (this.currentTracks.length === 0) return;
+        this._isAdvancing = true;
+        try {
+          await this.playTrackByIndex(this.currentTrackIndex + 1);
+        } finally {
+          this._isAdvancing = false;
+        }
+      } catch (error) {
+        this.emit('error', { message: `Track ended error: ${error.message}` });
+      }
+    };
+
+    this._boundListeners.pause = () => {
       this.state = PlaybackState.PAUSED;
       this.emit('paused');
-    });
+    };
 
-    audioPlayer.on('resume', () => {
+    this._boundListeners.resume = () => {
       this.state = PlaybackState.PLAYING;
       this.emit('resumed');
-    });
+    };
 
-    audioPlayer.on('stop', () => {
+    this._boundListeners.stop = () => {
       const track = this.currentTracks[this.currentTrackIndex];
       const album = this.currentAlbum;
       this.state = PlaybackState.IDLE;
       this.emit('stopped', { track, album });
-    });
+    };
 
-    audioPlayer.on('error', (data) => {
+    this._boundListeners.error = (data) => {
       this.state = PlaybackState.ERROR;
       this.emit('error', data);
-    });
+    };
 
-    audioPlayer.on('loading', () => {
+    this._boundListeners.loading = () => {
       this.state = PlaybackState.LOADING;
       this.emit('loading');
-    });
+    };
+
+    // Register listeners
+    audioPlayer.on('play', this._boundListeners.play);
+    audioPlayer.on('ended', this._boundListeners.ended);
+    audioPlayer.on('pause', this._boundListeners.pause);
+    audioPlayer.on('resume', this._boundListeners.resume);
+    audioPlayer.on('stop', this._boundListeners.stop);
+    audioPlayer.on('error', this._boundListeners.error);
+    audioPlayer.on('loading', this._boundListeners.loading);
+  }
+
+  // Cleanup method to remove all listeners
+  cleanup() {
+    if (this._boundListeners.play) {
+      audioPlayer.off('play', this._boundListeners.play);
+      audioPlayer.off('ended', this._boundListeners.ended);
+      audioPlayer.off('pause', this._boundListeners.pause);
+      audioPlayer.off('resume', this._boundListeners.resume);
+      audioPlayer.off('stop', this._boundListeners.stop);
+      audioPlayer.off('error', this._boundListeners.error);
+      audioPlayer.off('loading', this._boundListeners.loading);
+      this._boundListeners = {};
+    }
   }
 
   async playYear(year, startAlbumIndex = 0) {
@@ -185,8 +222,11 @@ export class PlaybackController extends EventEmitter {
   }
 
   async playAlbumByIndex(index) {
-    if (index >= this.yearAlbums.length) {
-      this.emit('yearComplete', { year: this.currentYear });
+    // Bounds check
+    if (index < 0 || index >= this.yearAlbums.length) {
+      if (index >= this.yearAlbums.length) {
+        this.emit('yearComplete', { year: this.currentYear });
+      }
       this.mode = PlaybackMode.IDLE;
       playbackRepo.setIdleMode();
       return false;
@@ -212,102 +252,156 @@ export class PlaybackController extends EventEmitter {
     return await this.playAlbum(album);
   }
 
-  async playTrackByIndex(index) {
-    if (index >= this.currentTracks.length) {
-      // Album complete
-      if (this.mode === PlaybackMode.YEAR_SEQUENTIAL) {
-        // Move to next album in year
-        this.emit('albumComplete', {
-          album: this.currentAlbum,
-          albumIndex: this.yearAlbumIndex
-        });
-        return await this.playAlbumByIndex(this.yearAlbumIndex + 1);
-      } else {
-        // Single album mode - stop
-        this.emit('albumComplete', { album: this.currentAlbum });
-        this.state = PlaybackState.IDLE;
-        return false;
-      }
-    }
+  async playTrackByIndex(index, skipCount = 0) {
+    // Use iteration instead of recursion to prevent stack overflow
+    let currentIndex = index < 0 ? 0 : index;
+    let currentSkipCount = skipCount;
 
-    this.currentTrackIndex = index;
-    const track = this.currentTracks[index];
-
-    // Update state
-    playbackRepo.setCurrentTrack(track.id, index);
-
-    // Get audio source
-    let audioSource;
-
-    // Check local file first
-    if (track.local_path && await storageManager.fileExists(track.local_path)) {
-      audioSource = track.local_path;
-    } else if (track.is_downloaded && this.currentAlbum) {
-      // Try to find local file
-      const slug = this.currentAlbum.slug;
-      const year = this.currentAlbum.year || 'unknown';
-      const localPath = storageManager.getTrackPath(
-        year,
-        slug,
-        track.track_number || index + 1,
-        track.name
-      );
-      if (await storageManager.fileExists(localPath)) {
-        audioSource = localPath;
-      }
-    }
-
-    // Fallback to streaming
-    if (!audioSource) {
-      if (track.download_url) {
-        audioSource = track.download_url;
-      } else if (track.page_url) {
-        const urls = await this.scraper.getTrackDirectUrl(track.page_url);
-        if (urls?.mp3) {
-          audioSource = urls.mp3;
-          // Cache URL
-          trackRepo.update(track.id, { downloadUrl: urls.mp3 });
+    while (currentSkipCount < MAX_SKIP) {
+      // Bounds check
+      if (currentIndex >= this.currentTracks.length) {
+        // Album complete
+        if (this.mode === PlaybackMode.YEAR_SEQUENTIAL) {
+          // Move to next album in year
+          this.emit('albumComplete', {
+            album: this.currentAlbum,
+            albumIndex: this.yearAlbumIndex
+          });
+          return await this.playAlbumByIndex(this.yearAlbumIndex + 1);
+        } else {
+          // Single album mode - stop
+          this.emit('albumComplete', { album: this.currentAlbum });
+          this.state = PlaybackState.IDLE;
+          return false;
         }
       }
+
+      this.currentTrackIndex = currentIndex;
+      const track = this.currentTracks[currentIndex];
+
+      // Null check for track
+      if (!track) {
+        this.emit('error', { message: `Invalid track at index ${currentIndex}` });
+        return false;
+      }
+
+      // Update state
+      playbackRepo.setCurrentTrack(track.id, currentIndex);
+
+      // Get audio source
+      let audioSource;
+
+      // Check local file first
+      if (track.local_path && await storageManager.fileExists(track.local_path)) {
+        audioSource = track.local_path;
+      } else if (track.is_downloaded && this.currentAlbum) {
+        // Try to find local file
+        const slug = this.currentAlbum.slug;
+        const year = this.currentAlbum.year || 'unknown';
+        const localPath = storageManager.getTrackPath(
+          year,
+          slug,
+          track.track_number || currentIndex + 1,
+          track.name
+        );
+        if (await storageManager.fileExists(localPath)) {
+          audioSource = localPath;
+        }
+      }
+
+      // Fallback to streaming
+      if (!audioSource) {
+        if (track.download_url) {
+          audioSource = track.download_url;
+        } else if (track.page_url) {
+          try {
+            const urls = await this.scraper.getTrackDirectUrl(track.page_url);
+            if (urls?.mp3) {
+              audioSource = urls.mp3;
+              // Cache URL (non-critical, don't let failure stop playback)
+              try {
+                trackRepo.update(track.id, { downloadUrl: urls.mp3 });
+              } catch {
+                // Ignore cache update errors
+              }
+            }
+          } catch (error) {
+            this.emit('error', { message: `Failed to get URL for: ${track.name}` });
+          }
+        }
+      }
+
+      if (!audioSource) {
+        this.emit('error', { message: `Cannot find audio source for: ${track.name}` });
+        // Skip to next track
+        currentIndex++;
+        currentSkipCount++;
+        continue;
+      }
+
+      // Play
+      try {
+        await audioPlayer.play(audioSource, {
+          id: track.id,
+          name: track.name,
+          duration: track.duration,
+          albumTitle: this.currentAlbum?.title
+        });
+        return true;
+      } catch (error) {
+        // Handle play errors and try next track
+        currentIndex++;
+        currentSkipCount++;
+        continue;
+      }
     }
 
-    if (!audioSource) {
-      this.emit('error', { message: `Cannot find audio source for: ${track.name}` });
-      // Skip to next track
-      return await this.playTrackByIndex(index + 1);
-    }
-
-    // Play
-    await audioPlayer.play(audioSource, {
-      id: track.id,
-      name: track.name,
-      duration: track.duration,
-      albumTitle: this.currentAlbum?.title
-    });
-
-    return true;
+    // Too many failed tracks
+    this.emit('error', { message: `Too many failed tracks (${MAX_SKIP}), stopping playback` });
+    this.state = PlaybackState.IDLE;
+    return false;
   }
 
   async next() {
-    if (this.currentTracks.length === 0) return false;
-    return await this.playTrackByIndex(this.currentTrackIndex + 1);
+    if (this._isAdvancing || this.currentTracks.length === 0) return false;
+    this._isAdvancing = true;
+    try {
+      return await this.playTrackByIndex(this.currentTrackIndex + 1);
+    } finally {
+      this._isAdvancing = false;
+    }
   }
 
   async previous() {
-    if (this.currentTracks.length === 0) return false;
-    const newIndex = Math.max(0, this.currentTrackIndex - 1);
-    return await this.playTrackByIndex(newIndex);
+    if (this._isAdvancing || this.currentTracks.length === 0) return false;
+    this._isAdvancing = true;
+    try {
+      const newIndex = Math.max(0, this.currentTrackIndex - 1);
+      return await this.playTrackByIndex(newIndex);
+    } finally {
+      this._isAdvancing = false;
+    }
   }
 
   async nextAlbum() {
-    if (this.mode !== PlaybackMode.YEAR_SEQUENTIAL) return false;
-    return await this.playAlbumByIndex(this.yearAlbumIndex + 1);
+    if (this._isAdvancing || this.mode !== PlaybackMode.YEAR_SEQUENTIAL) return false;
+    this._isAdvancing = true;
+    try {
+      return await this.playAlbumByIndex(this.yearAlbumIndex + 1);
+    } finally {
+      this._isAdvancing = false;
+    }
   }
 
   async previousAlbum() {
-    if (this.mode !== PlaybackMode.YEAR_SEQUENTIAL) return false;
-    const newIndex = Math.max(0, this.yearAlbumIndex - 1);
-    return await this.playAlbumByIndex(newIndex);
+    if (this._isAdvancing || this.mode !== PlaybackMode.YEAR_SEQUENTIAL) return false;
+    this._isAdvancing = true;
+    try {
+      const newIndex = Math.max(0, this.yearAlbumIndex - 1);
+      return await this.playAlbumByIndex(newIndex);
+    } finally {
+      this._isAdvancing = false;
+    }
   }
 
   togglePause() {
@@ -315,12 +409,21 @@ export class PlaybackController extends EventEmitter {
   }
 
   async stop() {
-    await audioPlayer.stop();
-    this.state = PlaybackState.IDLE;
-    playbackRepo.setIdleMode();
+    this._isStopping = true;
+    try {
+      await audioPlayer.stop();
+      this.state = PlaybackState.IDLE;
+      playbackRepo.setIdleMode();
+    } finally {
+      this._isStopping = false;
+    }
   }
 
   getStatus() {
+    const currentTrack = (this.currentTrackIndex >= 0 && this.currentTrackIndex < this.currentTracks.length)
+      ? this.currentTracks[this.currentTrackIndex]
+      : null;
+
     return {
       state: this.state,
       mode: this.mode,
@@ -330,7 +433,7 @@ export class PlaybackController extends EventEmitter {
       currentAlbum: this.currentAlbum,
       currentTrackIndex: this.currentTrackIndex,
       totalTracks: this.currentTracks.length,
-      currentTrack: this.currentTracks[this.currentTrackIndex] || null,
+      currentTrack,
       isPlaying: audioPlayer.isPlaying,
       isPaused: audioPlayer.isPaused
     };

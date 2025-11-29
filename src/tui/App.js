@@ -6,6 +6,7 @@ import { HistoryPanel } from './panels/HistoryPanel.js';
 import { StatusBar } from './panels/StatusBar.js';
 import { TitleBar } from './panels/TitleBar.js';
 import { helpText } from './utils/keyBindings.js';
+import { showLoginForm } from './utils/loginForm.js';
 import { settingsRepo } from '../data/repositories/settings-repo.js';
 
 export class App {
@@ -21,6 +22,7 @@ export class App {
     this.focusedPanel = 'navigation';
     this.isInitialized = false;
     this.dialogActive = false;
+    this._activeDialogCleanup = null; // Track active dialog cleanup function
   }
 
   async initialize() {
@@ -114,7 +116,8 @@ export class App {
 
   setupKeyBindings() {
     // Global keys - use program.on to capture before widgets
-    this.screen.program.on('keypress', (ch, key) => {
+    // Store handler reference for cleanup
+    this._globalKeyHandler = (ch, key) => {
       if (!key) return;
 
       // Skip global keys when dialog is active or textbox/input is focused
@@ -146,13 +149,17 @@ export class App {
 
       // Favorite: f
       if (key.name === 'f') {
-        this.toggleFavorite();
+        this.toggleFavorite().catch(err => {
+          this.panels.statusBar?.showError(`Favorite error: ${err?.message || 'Unknown error'}`);
+        });
         return;
       }
 
       // Refresh: r
       if (key.name === 'r') {
-        this.refreshCurrent();
+        this.refreshCurrent().catch(err => {
+          this.panels.statusBar?.showError(`Refresh error: ${err?.message || 'Unknown error'}`);
+        });
         return;
       }
 
@@ -176,7 +183,9 @@ export class App {
 
       // Download: d
       if (key.name === 'd') {
-        this.handleDownload();
+        this.handleDownload().catch(err => {
+          this.panels.statusBar?.showError(`Download error: ${err?.message || 'Unknown error'}`);
+        });
         return;
       }
 
@@ -190,13 +199,15 @@ export class App {
         this.cycleFocusReverse();
         return;
       }
-    });
+    };
+
+    this.screen.program.on('keypress', this._globalKeyHandler);
   }
 
   focusPanel(panelName) {
     // Blur current panel
     if (this.focusedPanel === 'navigation') {
-      this.panels.navigation.box.style.border.fg = 'cyan';
+      this.panels.navigation.blur();
     } else if (this.focusedPanel === 'favorites') {
       this.panels.favorites.blur();
     } else if (this.focusedPanel === 'history') {
@@ -206,7 +217,6 @@ export class App {
     // Focus new panel
     this.focusedPanel = panelName;
     if (panelName === 'navigation') {
-      this.panels.navigation.box.style.border.fg = 'white';
       this.panels.navigation.focus();
     } else if (panelName === 'favorites') {
       this.panels.favorites.focus();
@@ -234,130 +244,115 @@ export class App {
   setupPlaybackEvents() {
     const pc = this.playbackController;
 
-    pc.on('loading', () => {
-      this.panels.nowPlaying.setLoading();
-      this.panels.history.logInfo('Loading track...');
-    });
+    // Store bound listeners for cleanup
+    this._pcListeners = {
+      loading: () => {
+        this.panels.nowPlaying.setLoading();
+        this.panels.history.logInfo('Loading track...');
+      },
+      trackStart: (data) => {
+        this.panels.nowPlaying.setPlaying(
+          data.track,
+          data.album,
+          data.trackIndex,
+          data.totalTracks
+        );
 
-    pc.on('trackStart', (data) => {
-      this.panels.nowPlaying.setPlaying(
-        data.track,
-        data.album,
-        data.trackIndex,
-        data.totalTracks
-      );
+        const status = pc.getStatus();
+        if (status.mode === 'year_sequential') {
+          this.panels.nowPlaying.update({
+            year: status.currentYear,
+            albumIndex: status.yearAlbumIndex,
+            totalAlbums: status.totalYearAlbums
+          });
+        }
 
-      const status = pc.getStatus();
-      if (status.mode === 'year_sequential') {
-        this.panels.nowPlaying.update({
-          year: status.currentYear,
-          albumIndex: status.yearAlbumIndex,
-          totalAlbums: status.totalYearAlbums
-        });
+        this.panels.history.logPlay(`${data.track.name}`);
+      },
+      trackCompleted: (data) => {
+        this.panels.navigation.markTrackCompleted(data.track.id, data.album?.id);
+        this.panels.history.logInfo(`Completed: ${data.track.name}`);
+      },
+      paused: () => {
+        this.panels.nowPlaying.setPaused();
+        this.panels.history.logPause('Paused');
+      },
+      resumed: () => {
+        this.panels.nowPlaying.update({ state: 'playing' });
+        this.panels.history.logPlay('Resumed');
+      },
+      stopped: () => {
+        this.panels.nowPlaying.setIdle();
+        this.panels.history.logStop('Stopped');
+      },
+      error: (data) => {
+        this.panels.statusBar.showError(data.message || 'Playback error');
+        this.panels.nowPlaying.setError();
+        this.panels.history.logError(data.message || 'Playback error');
+      },
+      albumChange: (data) => {
+        this.panels.nowPlaying.setAlbum(data.album);
+        this.panels.statusBar.showInfo(`Now playing album: ${data.album.title}`);
+        this.panels.history.logInfo(`Album: ${data.album.title}`);
+      },
+      albumComplete: (data) => {
+        this.panels.statusBar.showInfo(`Album complete: ${data.album.title}`);
+      },
+      yearComplete: (data) => {
+        this.panels.statusBar.showSuccess(`Year ${data.year} complete!`);
+        this.panels.nowPlaying.setIdle();
+      },
+      loadingYear: (data) => {
+        this.panels.statusBar.showInfo(`Loading albums for ${data.year}...`);
+      },
+      yearLoaded: (data) => {
+        this.panels.statusBar.showInfo(`Loaded ${data.albumCount} albums for ${data.year}`);
+      },
+      loadingAlbum: (data) => {
+        this.panels.statusBar.showInfo(`Loading tracks for ${data.album.title}...`);
+      },
+      albumLoaded: (data) => {
+        this.panels.statusBar.showInfo(`Loaded ${data.trackCount} tracks`);
       }
+    };
 
-      this.panels.history.logPlay(`${data.track.name}`);
-    });
-
-    pc.on('trackCompleted', (data) => {
-      // Mark track as completed (played to the end)
-      this.panels.navigation.markTrackCompleted(data.track.id, data.album?.id);
-      this.panels.history.logInfo(`Completed: ${data.track.name}`);
-    });
-
-    pc.on('paused', () => {
-      this.panels.nowPlaying.setPaused();
-      this.panels.history.logPause('Paused');
-    });
-
-    pc.on('resumed', () => {
-      this.panels.nowPlaying.update({ state: 'playing' });
-      this.panels.history.logPlay('Resumed');
-    });
-
-    pc.on('stopped', () => {
-      this.panels.nowPlaying.setIdle();
-      this.panels.history.logStop('Stopped');
-    });
-
-    pc.on('error', (data) => {
-      this.panels.statusBar.showError(data.message || 'Playback error');
-      this.panels.nowPlaying.setError();
-      this.panels.history.logError(data.message || 'Playback error');
-    });
-
-    pc.on('albumChange', (data) => {
-      this.panels.nowPlaying.setAlbum(data.album);
-      this.panels.statusBar.showInfo(`Now playing album: ${data.album.title}`);
-      this.panels.history.logInfo(`Album: ${data.album.title}`);
-    });
-
-    pc.on('albumComplete', (data) => {
-      this.panels.statusBar.showInfo(`Album complete: ${data.album.title}`);
-    });
-
-    pc.on('yearComplete', (data) => {
-      this.panels.statusBar.showSuccess(`Year ${data.year} complete!`);
-      this.panels.nowPlaying.setIdle();
-    });
-
-    pc.on('loadingYear', (data) => {
-      this.panels.statusBar.showInfo(`Loading albums for ${data.year}...`);
-    });
-
-    pc.on('yearLoaded', (data) => {
-      this.panels.statusBar.showInfo(`Loaded ${data.albumCount} albums for ${data.year}`);
-    });
-
-    pc.on('loadingAlbum', (data) => {
-      this.panels.statusBar.showInfo(`Loading tracks for ${data.album.title}...`);
-    });
-
-    pc.on('albumLoaded', (data) => {
-      this.panels.statusBar.showInfo(`Loaded ${data.trackCount} tracks`);
-    });
+    // Register listeners
+    for (const [event, handler] of Object.entries(this._pcListeners)) {
+      pc.on(event, handler);
+    }
 
     // Downloader events
     if (this.downloader) {
-      this.downloader.on('start', (data) => {
-        this.panels.statusBar.showInfo(`Downloading: ${data.album.title}`);
-        this.panels.history.logDownload(`Started: ${data.album.title}`);
-      });
-
-      this.downloader.on('zipProgress', (data) => {
-        const formatStr = data.format?.toUpperCase() || '';
-        if (data.percent !== undefined) {
-          this.panels.statusBar.showInfo(`Downloading ${formatStr}: ${data.percent}%`);
+      this._dlListeners = {
+        start: (data) => {
+          this.panels.statusBar.showInfo(`Downloading: ${data.album.title}`);
+          this.panels.history.logDownload(`Started: ${data.album.title}`);
+        },
+        zipProgress: (data) => {
+          const formatStr = data.format?.toUpperCase() || '';
+          if (data.percent !== undefined) {
+            this.panels.statusBar.showInfo(`Downloading ${formatStr}: ${data.percent}%`);
+          }
+        },
+        zipComplete: (data) => {
+          const formatStr = data.format?.toUpperCase() || '';
+          this.panels.history.logDownload(`Downloaded: ${formatStr}.zip`);
+        },
+        complete: (data) => {
+          this.panels.statusBar.showSuccess(`Download complete: ${data.album.title}`);
+          this.panels.favorites.refresh();
+          this.panels.history.logDownload(`Complete: ${data.album.title}`);
+        },
+        error: (data) => {
+          const errorMsg = data?.error?.message || 'Unknown error';
+          this.panels.statusBar.showError(`Download failed: ${errorMsg}`);
+          this.panels.history.logError(`Download failed: ${errorMsg}`);
         }
-      });
+      };
 
-      this.downloader.on('zipComplete', (data) => {
-        const formatStr = data.format?.toUpperCase() || '';
-        this.panels.history.logDownload(`Downloaded: ${formatStr}.zip`);
-      });
-
-      this.downloader.on('imagesStart', (data) => {
-        this.panels.statusBar.showInfo(`Downloading images: 0/${data.total}`);
-      });
-
-      this.downloader.on('imageProgress', (data) => {
-        this.panels.statusBar.showInfo(`Downloading images: ${data.current}/${data.total}`);
-      });
-
-      this.downloader.on('imagesComplete', (data) => {
-        this.panels.history.logDownload(`Downloaded: ${data.count} images`);
-      });
-
-      this.downloader.on('complete', (data) => {
-        this.panels.statusBar.showSuccess(`Download complete: ${data.album.title}`);
-        this.panels.favorites.refresh();
-        this.panels.history.logDownload(`Complete: ${data.album.title}`);
-      });
-
-      this.downloader.on('error', (data) => {
-        this.panels.statusBar.showError(`Download failed: ${data.error.message}`);
-        this.panels.history.logError(`Download failed: ${data.error.message}`);
-      });
+      for (const [event, handler] of Object.entries(this._dlListeners)) {
+        this.downloader.on(event, handler);
+      }
     }
   }
 
@@ -472,7 +467,14 @@ export class App {
 
       // Fetch album info (images, metadata) in background
       this.scraper.getAlbumInfo(album.url).then(info => {
-        this.panels.nowPlaying.setAlbumInfo(info);
+        // Null check in case panel is destroyed before async completes
+        if (this.panels.nowPlaying) {
+          this.panels.nowPlaying.setAlbumInfo(info);
+        }
+      }).catch(error => {
+        if (this.panels.history) {
+          this.panels.history.logError(`Failed to load album info: ${error?.message || 'Unknown error'}`);
+        }
       });
 
       this.panels.statusBar.reset();
@@ -502,7 +504,14 @@ export class App {
 
     // Fetch album info in background
     this.scraper.getAlbumInfo(album.url).then(info => {
-      this.panels.nowPlaying.setAlbumInfo(info);
+      // Null check in case panel is destroyed before async completes
+      if (this.panels.nowPlaying) {
+        this.panels.nowPlaying.setAlbumInfo(info);
+      }
+    }).catch(error => {
+      if (this.panels.history) {
+        this.panels.history.logError(`Failed to load album info: ${error?.message || 'Unknown error'}`);
+      }
     });
   }
 
@@ -531,22 +540,6 @@ export class App {
         isPlayed ? `Marked album as played: ${item.album.title}` : `Unmarked album: ${item.album.title}`
       );
     }
-  }
-
-  async nextTrack() {
-    await this.playbackController.next();
-  }
-
-  async previousTrack() {
-    await this.playbackController.previous();
-  }
-
-  async nextAlbum() {
-    await this.playbackController.nextAlbum();
-  }
-
-  async previousAlbum() {
-    await this.playbackController.previousAlbum();
   }
 
   async stop() {
@@ -757,161 +750,40 @@ export class App {
   showDownloadMenu(album) {
     const isDownloaded = album.is_downloaded;
     const credentials = settingsRepo.getCredentials();
-    const downloadedText = isDownloaded ? ' {yellow-fg}(Re-download){/yellow-fg}' : '';
+    const downloadedText = isDownloaded ? ' (Re-download)' : '';
 
-    const dialogBox = blessed.box({
-      parent: this.screen,
-      top: 'center',
-      left: 'center',
-      width: 50,
-      height: 12,
-      tags: true,
-      border: { type: 'line' },
-      style: {
-        border: { fg: 'cyan' },
-        bg: 'black'
+    showLoginForm({
+      screen: this.screen,
+      title: `Download Album${downloadedText}`,
+      subtitle: album.title,
+      credentials,
+      setDialogActive: (active) => { this.dialogActive = active; },
+      onSubmit: async (username, password) => {
+        if (!username || !password) {
+          this.panels.statusBar.showError('Username and password required');
+          return;
+        }
+
+        this.panels.statusBar.showInfo('Logging in...');
+
+        try {
+          await this.scraper.login(username, password);
+          settingsRepo.setCredentials(username, password);
+          this.panels.statusBar.showSuccess('Logged in as ' + username);
+          this.panels.history.logInfo('Logged in as ' + username);
+          this.updateLoginStatus();
+
+          // Now proceed with download (await to ensure errors are handled)
+          await this.startDownload(album);
+        } catch (error) {
+          this.panels.statusBar.showError('Login failed: ' + error.message);
+          this.panels.history.logError('Login failed: ' + error.message);
+        }
+      },
+      onCancel: () => {
+        this.panels.statusBar.showInfo('Download cancelled');
       }
     });
-
-    let usernameValue = credentials?.username || '';
-    let passwordValue = credentials?.password || '';
-
-    dialogBox.setContent(`
-  {bold}Download Album{/bold}${downloadedText}
-  {cyan-fg}${album.title}{/cyan-fg}
-
-  Username: [ ${usernameValue.padEnd(25)} ]
-  Password: [ ${'*'.repeat(passwordValue.length).padEnd(25)} ]
-
-  {gray-fg}[Tab] Switch  [Enter] Download  [Esc] Cancel{/gray-fg}
-`);
-
-    const usernameInput = blessed.textbox({
-      parent: dialogBox,
-      top: 4,
-      left: 12,
-      width: 29,
-      height: 1,
-      style: { fg: 'white', bg: 'black' }
-    });
-
-    const passwordInput = blessed.textbox({
-      parent: dialogBox,
-      top: 5,
-      left: 12,
-      width: 29,
-      height: 1,
-      censor: true,
-      style: { fg: 'white', bg: 'black' }
-    });
-
-    usernameInput.setValue(usernameValue);
-    passwordInput.setValue(passwordValue);
-
-    let currentField = 'username';
-    let switchingField = false;
-    this.dialogActive = true;
-
-    const cleanup = () => {
-      this.dialogActive = false;
-      dialogBox.destroy();
-      this.screen.render();
-    };
-
-    const startDownloadWithLogin = async () => {
-      const username = usernameInput.getValue().trim();
-      const password = passwordInput.getValue().trim();
-
-      if (!username || !password) {
-        this.panels.statusBar.showError('Username and password required');
-        cleanup();
-        return;
-      }
-
-      cleanup();
-      this.panels.statusBar.showInfo('Logging in...');
-
-      try {
-        await this.scraper.login(username, password);
-        settingsRepo.setCredentials(username, password);
-        this.panels.statusBar.showSuccess('Logged in as ' + username);
-        this.panels.history.logInfo('Logged in as ' + username);
-        this.updateLoginStatus();
-
-        // Now proceed with download
-        this.startDownload(album);
-      } catch (error) {
-        this.panels.statusBar.showError('Login failed: ' + error.message);
-        this.panels.history.logError('Login failed: ' + error.message);
-      }
-    };
-
-    const focusUsername = () => {
-      currentField = 'username';
-      usernameInput.readInput();
-    };
-
-    const focusPassword = () => {
-      currentField = 'password';
-      passwordInput.readInput();
-    };
-
-    const switchToPassword = () => {
-      switchingField = true;
-      usernameInput.cancel();
-    };
-
-    const switchToUsername = () => {
-      switchingField = true;
-      passwordInput.cancel();
-    };
-
-    usernameInput.on('submit', () => {
-      focusPassword();
-    });
-
-    usernameInput.on('cancel', () => {
-      if (switchingField) {
-        switchingField = false;
-        setTimeout(() => focusPassword(), 10);
-      } else {
-        cleanup();
-      }
-    });
-
-    usernameInput.on('keypress', (ch, key) => {
-      if (key && key.name === 'tab') {
-        switchToPassword();
-        return false;
-      }
-    });
-
-    passwordInput.on('submit', () => {
-      startDownloadWithLogin();
-    });
-
-    passwordInput.on('cancel', () => {
-      if (switchingField) {
-        switchingField = false;
-        setTimeout(() => focusUsername(), 10);
-      } else {
-        cleanup();
-      }
-    });
-
-    passwordInput.on('keypress', (ch, key) => {
-      if (key && key.name === 'tab') {
-        switchToUsername();
-        return false;
-      }
-    });
-
-    dialogBox.key(['escape'], () => {
-      cleanup();
-    });
-
-    this.screen.render();
-    focusUsername();
   }
 
   async startDownload(album) {
@@ -924,6 +796,8 @@ export class App {
   }
 
   showConfirm(message, callback) {
+    this.dialogActive = true;
+
     const confirmBox = blessed.box({
       parent: this.screen,
       top: 'center',
@@ -941,44 +815,65 @@ export class App {
 
     this.screen.render();
 
+    let handled = false;
+
     const cleanup = () => {
+      if (handled) return;
+      handled = true;
+      this.dialogActive = false;
+      this._activeDialogCleanup = null;
+      this.screen.removeListener('keypress', handleKey);
       confirmBox.destroy();
       this.screen.render();
     };
 
+    // Track cleanup for external shutdown
+    this._activeDialogCleanup = cleanup;
+
     const handleKey = (ch, key) => {
+      if (handled) return;
       if (key.name === 'y') {
         cleanup();
-        callback(true);
+        try {
+          callback(true);
+        } catch (error) {
+          this.panels.statusBar?.showError(`Error: ${error.message}`);
+        }
       } else if (key.name === 'n' || key.name === 'escape') {
         cleanup();
-        callback(false);
+        try {
+          callback(false);
+        } catch (error) {
+          this.panels.statusBar?.showError(`Error: ${error.message}`);
+        }
       }
     };
 
-    this.screen.once('keypress', handleKey);
+    this.screen.on('keypress', handleKey);
   }
 
   showLoginDialog() {
     const isLoggedIn = this.scraper.isLoggedIn;
     const credentials = settingsRepo.getCredentials();
 
-    const dialogBox = blessed.box({
-      parent: this.screen,
-      top: 'center',
-      left: 'center',
-      width: 50,
-      height: isLoggedIn ? 8 : 12,
-      tags: true,
-      border: { type: 'line' },
-      style: {
-        border: { fg: 'cyan' },
-        bg: 'black'
-      }
-    });
-
     if (isLoggedIn) {
       // Show logout option
+      this.dialogActive = true;
+
+      const dialogBox = blessed.box({
+        parent: this.screen,
+        top: 'center',
+        left: 'center',
+        width: 50,
+        height: 8,
+        tags: true,
+        border: { type: 'line' },
+        style: {
+          border: { fg: 'cyan' },
+          bg: 'black'
+        }
+      });
+
       dialogBox.setContent(`
   {bold}Khinsider Login{/bold}
 
@@ -989,151 +884,64 @@ export class App {
 
       this.screen.render();
 
-      const handleKey = (ch, key) => {
-        if (ch === 'L' || ch === 'l') {
-          dialogBox.destroy();
-          this.handleLogout();
-        } else if (key.name === 'escape') {
-          dialogBox.destroy();
-          this.screen.render();
-        }
-      };
-
-      this.screen.once('keypress', handleKey);
-    } else {
-      // Show login form
-      let usernameValue = credentials?.username || '';
-      let passwordValue = credentials?.password || '';
-
-      dialogBox.setContent(`
-  {bold}Khinsider Login{/bold}
-
-  Username: [ ${usernameValue.padEnd(25)} ]
-  Password: [ ${'*'.repeat(passwordValue.length).padEnd(25)} ]
-
-  {gray-fg}[Tab] Switch field  [Enter] Login  [Esc] Cancel{/gray-fg}
-`);
-
-      const usernameInput = blessed.textbox({
-        parent: dialogBox,
-        top: 3,
-        left: 12,
-        width: 29,
-        height: 1,
-        style: { fg: 'white', bg: 'black' }
-      });
-
-      const passwordInput = blessed.textbox({
-        parent: dialogBox,
-        top: 4,
-        left: 12,
-        width: 29,
-        height: 1,
-        censor: true,
-        style: { fg: 'white', bg: 'black' }
-      });
-
-      usernameInput.setValue(usernameValue);
-      passwordInput.setValue(passwordValue);
-
-      let switchingField = false;
-      this.dialogActive = true;
+      let handled = false;
 
       const cleanup = () => {
+        if (handled) return;
+        handled = true;
         this.dialogActive = false;
+        this._activeDialogCleanup = null;
+        this.screen.removeListener('keypress', handleKey);
         dialogBox.destroy();
         this.screen.render();
       };
 
-      const submitLogin = async () => {
-        const username = usernameInput.getValue().trim();
-        const password = passwordInput.getValue().trim();
+      // Track cleanup for external shutdown
+      this._activeDialogCleanup = cleanup;
 
-        if (!username || !password) {
-          this.panels.statusBar.showError('Username and password required');
+      const handleKey = (ch, key) => {
+        if (handled) return;
+        if (ch === 'L' || ch === 'l') {
           cleanup();
-          return;
-        }
-
-        cleanup();
-        this.panels.statusBar.showInfo('Logging in...');
-
-        try {
-          await this.scraper.login(username, password);
-          settingsRepo.setCredentials(username, password);
-          this.panels.statusBar.showSuccess('Logged in as ' + username);
-          this.panels.history.logInfo('Logged in as ' + username);
-          this.updateLoginStatus();
-        } catch (error) {
-          this.panels.statusBar.showError('Login failed: ' + error.message);
-          this.panels.history.logError('Login failed: ' + error.message);
-        }
-      };
-
-      const focusUsername = () => {
-        usernameInput.readInput();
-      };
-
-      const focusPassword = () => {
-        passwordInput.readInput();
-      };
-
-      const switchToPassword = () => {
-        switchingField = true;
-        usernameInput.cancel();
-      };
-
-      const switchToUsername = () => {
-        switchingField = true;
-        passwordInput.cancel();
-      };
-
-      usernameInput.on('submit', () => {
-        focusPassword();
-      });
-
-      usernameInput.on('cancel', () => {
-        if (switchingField) {
-          switchingField = false;
-          setTimeout(() => focusPassword(), 10);
-        } else {
+          this.handleLogout().catch(error => {
+            this.panels.statusBar?.showError(`Logout error: ${error.message}`);
+          });
+        } else if (key.name === 'escape') {
           cleanup();
         }
-      });
+      };
 
-      usernameInput.on('keypress', (ch, key) => {
-        if (key && key.name === 'tab') {
-          switchToPassword();
-          return false;
+      this.screen.on('keypress', handleKey);
+    } else {
+      // Show login form using common component
+      showLoginForm({
+        screen: this.screen,
+        title: 'Khinsider Login',
+        credentials,
+        setDialogActive: (active) => { this.dialogActive = active; },
+        onSubmit: async (username, password) => {
+          if (!username || !password) {
+            this.panels.statusBar.showError('Username and password required');
+            return;
+          }
+
+          this.panels.statusBar.showInfo('Logging in...');
+
+          try {
+            await this.scraper.login(username, password);
+            settingsRepo.setCredentials(username, password);
+            this.panels.statusBar.showSuccess('Logged in as ' + username);
+            this.panels.history.logInfo('Logged in as ' + username);
+            this.updateLoginStatus();
+          } catch (error) {
+            this.panels.statusBar.showError('Login failed: ' + error.message);
+            this.panels.history.logError('Login failed: ' + error.message);
+          }
+        },
+        onCancel: () => {
+          // Do nothing on cancel
         }
       });
-
-      passwordInput.on('submit', () => {
-        submitLogin();
-      });
-
-      passwordInput.on('cancel', () => {
-        if (switchingField) {
-          switchingField = false;
-          setTimeout(() => focusUsername(), 10);
-        } else {
-          cleanup();
-        }
-      });
-
-      passwordInput.on('keypress', (ch, key) => {
-        if (key && key.name === 'tab') {
-          switchToUsername();
-          return false;
-        }
-      });
-
-      dialogBox.key(['escape'], () => {
-        cleanup();
-      });
-
-      this.screen.render();
-      focusUsername();
     }
   }
 
@@ -1147,6 +955,8 @@ export class App {
   }
 
   showHelp() {
+    this.dialogActive = true;
+
     const helpBox = blessed.box({
       parent: this.screen,
       top: 'center',
@@ -1164,10 +974,21 @@ export class App {
 
     this.screen.render();
 
+    let closed = false;
+
     const closeHelp = () => {
+      if (closed) return;
+      closed = true;
+      this.dialogActive = false;
+      this._activeDialogCleanup = null;
+      // Remove the onceKey listener to prevent memory leak
+      this.screen.unkey(['escape', 'q', '?', 'enter'], closeHelp);
       helpBox.destroy();
       this.screen.render();
     };
+
+    // Track cleanup for external shutdown
+    this._activeDialogCleanup = closeHelp;
 
     this.screen.onceKey(['escape', 'q', '?', 'enter'], closeHelp);
   }
@@ -1178,9 +999,52 @@ export class App {
   }
 
   async quit() {
+    // Clean up any active dialog
+    if (this._activeDialogCleanup) {
+      try {
+        this._activeDialogCleanup();
+      } catch {
+        // Ignore cleanup errors
+      }
+      this._activeDialogCleanup = null;
+    }
+
+    // Clean up global keypress handler
+    if (this._globalKeyHandler) {
+      this.screen.program.removeListener('keypress', this._globalKeyHandler);
+      this._globalKeyHandler = null;
+    }
+
     // Save current position before quitting
-    this.panels.navigation.saveCurrentPosition();
+    if (this.panels?.navigation) {
+      this.panels.navigation.saveCurrentPosition();
+    }
+
+    // Stop playback first (before removing listeners)
     await this.playbackController.stop();
+
+    // Clean up playback controller listeners (after stop completes)
+    if (this._pcListeners) {
+      for (const [event, handler] of Object.entries(this._pcListeners)) {
+        this.playbackController.off(event, handler);
+      }
+      this._pcListeners = null;
+    }
+    this.playbackController.cleanup(); // Remove audioPlayer listeners
+
+    // Clean up downloader listeners
+    if (this._dlListeners && this.downloader) {
+      for (const [event, handler] of Object.entries(this._dlListeners)) {
+        this.downloader.off(event, handler);
+      }
+      this._dlListeners = null;
+    }
+
+    // Clean up StatusBar timer
+    if (this.panels.statusBar) {
+      this.panels.statusBar.destroy();
+    }
+
     this.screen.destroy();
     process.exit(0);
   }

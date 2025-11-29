@@ -43,10 +43,15 @@ export class StatusBar {
       clearTimeout(this.messageTimeout);
     }
 
+    // Guard against destroyed elements
+    if (!this.content) return;
+
     this.content.setContent(`{yellow-fg}${message}{/yellow-fg}`);
     this.screen.render();
 
     this.messageTimeout = setTimeout(() => {
+      // Guard against destroyed elements in timeout callback
+      if (!this.content) return;
       this.content.setContent(getStatusBarText());
       this.screen.render();
     }, duration);
@@ -67,9 +72,21 @@ export class StatusBar {
   reset() {
     if (this.messageTimeout) {
       clearTimeout(this.messageTimeout);
+      this.messageTimeout = null;
     }
+    // Guard against destroyed elements
+    if (!this.content) return;
     this.content.setContent(getStatusBarText());
     this.screen.render();
+  }
+
+  destroy() {
+    if (this.messageTimeout) {
+      clearTimeout(this.messageTimeout);
+      this.messageTimeout = null;
+    }
+    // Mark as destroyed to prevent timeout callbacks from accessing elements
+    this.content = null;
   }
 
   getBox() {

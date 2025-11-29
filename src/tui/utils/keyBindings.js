@@ -1,31 +1,3 @@
-export const keyBindings = {
-  // Global keys
-  global: {
-    'space': 'togglePause',
-    'f': 'toggleFavorite',
-    'd': 'download',
-    'p': 'togglePlayed',
-    'i': 'toggleImages',
-    'q': 'quit',
-    '?': 'help'
-  },
-
-  // Navigation panel
-  navigation: {
-    'up': 'moveUp',
-    'k': 'moveUp',
-    'down': 'moveDown',
-    'j': 'moveDown',
-    'enter': 'select',
-    'left': 'collapse',
-    'h': 'collapse',
-    'right': 'expand',
-    'l': 'expand',
-    'g': 'goToTop',
-    'G': 'goToBottom'
-  }
-};
-
 export const helpText = `
 ╔═══════════════════════════════════════════════════════╗
 ║               Khinsider Player - Help                 ║
@@ -53,16 +25,6 @@ export const helpText = `
 ║    q         Quit                                     ║
 ╚═══════════════════════════════════════════════════════╝
 `;
-
-export function getKeyDescription(key) {
-  const descriptions = {
-    'space': '[Space] Play/Pause',
-    'f': '[f] Favorite',
-    'q': '[q] Quit',
-    '?': '[?] Help'
-  };
-  return descriptions[key] || '';
-}
 
 export function getStatusBarText() {
   return ' [Space] Pause  [f] Favorite  [d] Download  [p] Played  [i] Images  [?] Help  [q] Quit ';

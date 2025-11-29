@@ -3,10 +3,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import { storageManager, slugify } from './manager.js';
 import { albumRepo } from '../data/repositories/album-repo.js';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-
-const execAsync = promisify(exec);
+import { METADATA_VERSION } from '../constants.js';
 
 export class AlbumDownloader extends EventEmitter {
   constructor(scraper) {
@@ -15,42 +12,79 @@ export class AlbumDownloader extends EventEmitter {
     this.isDownloading = false;
     this.currentDownload = null;
     this.aborted = false;
+    this.currentStream = null;
+    this.currentAlbumPath = null;
   }
 
   async downloadFile(url, destPath, options = {}) {
     const { onProgress } = options;
 
+    // Check if aborted before starting
+    if (this.aborted) {
+      throw new Error('Download aborted');
+    }
+
     await fs.ensureDir(path.dirname(destPath));
 
-    const response = await this.scraper.client({
-      method: 'GET',
-      url: url,
-      responseType: 'stream',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-      }
-    });
+    // Use rate-limited streaming request
+    const response = await this.scraper.makeStreamRequest(url);
 
     const totalLength = parseInt(response.headers['content-length'], 10) || 0;
     let downloadedLength = 0;
 
     const writer = fs.createWriteStream(destPath);
-
-    response.data.on('data', (chunk) => {
-      downloadedLength += chunk.length;
-      if (onProgress && totalLength > 0) {
-        onProgress({
-          downloaded: downloadedLength,
-          total: totalLength,
-          percent: Math.round((downloadedLength / totalLength) * 100)
-        });
-      }
-    });
+    this.currentStream = response.data;
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const handleError = async (err) => {
+        if (settled) return;
+        settled = true;
+        this.currentStream = null;
+
+        // Clean up both streams and partial file on error
+        try {
+          response.data.destroy();
+          writer.destroy();
+          await fs.unlink(destPath).catch(() => {});
+        } catch {
+          // Ignore cleanup errors
+        }
+        reject(err);
+      };
+
+      response.data.on('data', (chunk) => {
+        // Check for abort during download
+        if (this.aborted) {
+          handleError(new Error('Download aborted')).catch(() => {});
+          return;
+        }
+        downloadedLength += chunk.length;
+        if (onProgress && totalLength > 0) {
+          try {
+            onProgress({
+              downloaded: downloadedLength,
+              total: totalLength,
+              percent: Math.round((downloadedLength / totalLength) * 100)
+            });
+          } catch {
+            // Ignore progress callback errors
+          }
+        }
+      });
+
       response.data.pipe(writer);
-      writer.on('finish', () => resolve(destPath));
-      writer.on('error', reject);
+
+      writer.on('finish', () => {
+        if (settled) return;
+        settled = true;
+        this.currentStream = null;
+        resolve(destPath);
+      });
+
+      writer.on('error', handleError);
+      response.data.on('error', handleError);
     });
   }
 
@@ -124,69 +158,6 @@ export class AlbumDownloader extends EventEmitter {
     return results;
   }
 
-  async downloadAlbumImages(album, albumPath, albumSlug) {
-    // Get album info with images
-    let albumInfo;
-    try {
-      albumInfo = await this.scraper.getAlbumInfo(album.url);
-    } catch (error) {
-      this.emit('imagesError', { album, error });
-      return null;
-    }
-
-    if (!albumInfo.images || albumInfo.images.length === 0) {
-      return null;
-    }
-
-    // Create temp directory for images
-    const tempImagesPath = path.join(albumPath, '_images_temp');
-    await fs.ensureDir(tempImagesPath);
-
-    const downloadedImages = [];
-
-    this.emit('imagesStart', { album, total: albumInfo.images.length });
-
-    for (let i = 0; i < albumInfo.images.length; i++) {
-      if (this.aborted) break;
-
-      const imageUrl = albumInfo.images[i];
-      const ext = path.extname(imageUrl) || '.jpg';
-      const filename = `image-${String(i + 1).padStart(2, '0')}${ext}`;
-      const imagePath = path.join(tempImagesPath, filename);
-
-      try {
-        this.emit('imageProgress', {
-          album,
-          current: i + 1,
-          total: albumInfo.images.length,
-          filename
-        });
-
-        await this.downloadFile(imageUrl, imagePath);
-        downloadedImages.push({ filename, path: imagePath, url: imageUrl });
-      } catch (error) {
-        this.emit('imageError', { album, imageUrl, error });
-      }
-    }
-
-    // Compress images to {albumSlug}-images.zip
-    const imagesZipName = `${albumSlug}-images.zip`;
-    if (downloadedImages.length > 0) {
-      const imagesZipPath = path.join(albumPath, imagesZipName);
-      try {
-        await execAsync(`cd "${tempImagesPath}" && zip -r "${imagesZipPath}" .`);
-        this.emit('imagesComplete', { album, count: downloadedImages.length, zipPath: imagesZipPath });
-      } catch (error) {
-        this.emit('imagesError', { album, error });
-      }
-    }
-
-    // Clean up temp directory
-    await fs.remove(tempImagesPath);
-
-    return { images: downloadedImages, zipName: imagesZipName };
-  }
-
   async downloadAlbum(album) {
     if (this.isDownloading) {
       throw new Error('Already downloading');
@@ -197,8 +168,13 @@ export class AlbumDownloader extends EventEmitter {
     this.currentDownload = { album };
 
     const slug = slugify(album.title);
+    // Validate slug is not empty (could happen if title has only special chars)
+    if (!slug || slug.length === 0) {
+      throw new Error('Cannot create album directory: invalid album title');
+    }
     const year = album.year || 'unknown';
     const albumPath = await storageManager.createAlbumDirectory(year, slug);
+    this.currentAlbumPath = albumPath;
 
     this.emit('start', { album });
 
@@ -209,13 +185,10 @@ export class AlbumDownloader extends EventEmitter {
       // Download MP3 and FLAC ZIPs
       const zipResults = await this.downloadBulkZips(album, albumPath, slug);
 
-      // Download album images and compress to images.zip
-      const imagesResult = await this.downloadAlbumImages(album, albumPath, slug);
-
       // Save metadata
       const metadataName = `${slug}-metadata.json`;
       const metadata = {
-        version: 4,
+        version: METADATA_VERSION,
         albumSlug: slug,
         title: album.title,
         url: album.url,
@@ -226,8 +199,7 @@ export class AlbumDownloader extends EventEmitter {
         files: {
           cover: coverName || null,
           mp3Zip: zipResults.mp3 || null,
-          flacZip: zipResults.flac || null,
-          imagesZip: imagesResult?.zipName || null
+          flacZip: zipResults.flac || null
         }
       };
 
@@ -250,17 +222,43 @@ export class AlbumDownloader extends EventEmitter {
         files: metadata.files
       };
     } catch (error) {
+      // Clean up partial download on any error
+      if (this.currentAlbumPath) {
+        try {
+          await fs.remove(this.currentAlbumPath);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
       this.emit('error', { album, error });
       throw error;
     } finally {
       this.isDownloading = false;
       this.currentDownload = null;
+      this.currentAlbumPath = null;
+      this.currentStream = null;
     }
   }
 
-  abort() {
+  async abort() {
     this.aborted = true;
+
+    // Destroy current stream if active
+    if (this.currentStream) {
+      this.currentStream.destroy();
+      this.currentStream = null;
+    }
+
     this.emit('aborted', this.currentDownload);
+
+    // Clean up partial download directory
+    if (this.currentAlbumPath) {
+      try {
+        await fs.remove(this.currentAlbumPath);
+      } catch (error) {
+        // Ignore cleanup errors
+      }
+    }
   }
 
   getStatus() {

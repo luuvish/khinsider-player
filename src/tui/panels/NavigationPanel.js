@@ -337,6 +337,11 @@ export class NavigationPanel {
   // ─────────────────────────────────────────────────────────────
 
   openSearch() {
+    // Close existing search box if any to prevent duplicates
+    if (this.searchBox) {
+      this.closeSearchBox();
+    }
+
     this.searchBox = blessed.textbox({
       parent: this.screen,
       bottom: 0,
@@ -370,6 +375,10 @@ export class NavigationPanel {
 
   closeSearchBox() {
     if (this.searchBox) {
+      // Explicitly remove all listeners before destroying
+      this.searchBox.removeAllListeners('submit');
+      this.searchBox.removeAllListeners('cancel');
+      this.searchBox.removeAllListeners('keypress');
       this.searchBox.destroy();
       this.searchBox = null;
       this.list.focus();
@@ -668,12 +677,18 @@ export class NavigationPanel {
       this.list.setItems(this.cachedItems.map(i => i.text));
 
       const targetIdx = Math.min(pos.selectedIndex || 0, this.cachedItems.length - 1);
-      this.list.selected = targetIdx;
-      this.centerSelection(targetIdx);
+      if (this.list) {
+        this.list.selected = targetIdx;
+        this.centerSelection(targetIdx);
+      }
       this.updateLabel();
       this.screen.render();
 
       return true;
+    } catch (error) {
+      // Log error but don't crash - restore failed gracefully
+      console.error('Failed to restore navigation position:', error.message);
+      return false;
     } finally {
       this.isRestoring = false;
     }
@@ -740,7 +755,18 @@ export class NavigationPanel {
   }
 
   focus() {
+    this.box.style.border.fg = 'white';
     this.list.focus();
+    this.screen.render();
+  }
+
+  blur() {
+    // Close search box when panel loses focus
+    if (this.searchBox) {
+      this.closeSearchBox();
+    }
+    this.box.style.border.fg = 'cyan';
+    this.screen.render();
   }
 
   getBox() {
@@ -759,7 +785,8 @@ export class NavigationPanel {
         // Update in albums cache
         for (const year in this.albums) {
           const idx = this.albums[year]?.findIndex(a => a.id === freshAlbum.id);
-          if (idx !== -1) {
+          // Check idx >= 0 because findIndex returns -1 if not found, undefined if array is undefined
+          if (idx >= 0) {
             this.albums[year][idx] = freshAlbum;
             break;
           }
@@ -775,7 +802,7 @@ export class NavigationPanel {
       if (freshAlbum) {
         for (const year in this.albums) {
           const idx = this.albums[year]?.findIndex(a => a.id === freshAlbum.id);
-          if (idx !== -1) {
+          if (idx >= 0) {
             this.albums[year][idx] = freshAlbum;
             break;
           }

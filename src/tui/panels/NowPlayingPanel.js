@@ -1,5 +1,6 @@
 import blessed from 'blessed';
 import { formatDuration, truncate } from '../utils/formatters.js';
+import { PlaybackState } from '../../constants.js';
 
 export class NowPlayingPanel {
   constructor(screen) {
@@ -10,7 +11,7 @@ export class NowPlayingPanel {
     this.totalTracks = 0;
     this.albumIndex = 0;
     this.totalAlbums = 0;
-    this.state = 'idle';
+    this.state = PlaybackState.IDLE;
     this.year = null;
     this.isFavorite = false;
     this.isDownloaded = false;
@@ -68,7 +69,7 @@ export class NowPlayingPanel {
   }
 
   getTrackContent() {
-    if (this.state === 'idle') {
+    if (this.state === PlaybackState.IDLE) {
       return '{gray-fg}No track playing{/gray-fg}';
     }
 
@@ -137,10 +138,10 @@ export class NowPlayingPanel {
 
   getStateIcon() {
     switch (this.state) {
-      case 'playing': return '{green-fg}▶{/green-fg}';
-      case 'paused': return '{yellow-fg}❚❚{/yellow-fg}';
-      case 'loading': return '{cyan-fg}⟳{/cyan-fg}';
-      case 'error': return '{red-fg}✖{/red-fg}';
+      case PlaybackState.PLAYING: return '{green-fg}▶{/green-fg}';
+      case PlaybackState.PAUSED: return '{yellow-fg}❚❚{/yellow-fg}';
+      case PlaybackState.LOADING: return '{cyan-fg}⟳{/cyan-fg}';
+      case PlaybackState.ERROR: return '{red-fg}✖{/red-fg}';
       default: return '{gray-fg}■{/gray-fg}';
     }
   }
@@ -164,16 +165,16 @@ export class NowPlayingPanel {
       album,
       trackIndex,
       totalTracks,
-      state: 'playing'
+      state: PlaybackState.PLAYING
     });
   }
 
   setPaused() {
-    this.update({ state: 'paused' });
+    this.update({ state: PlaybackState.PAUSED });
   }
 
   setLoading() {
-    this.update({ state: 'loading' });
+    this.update({ state: PlaybackState.LOADING });
   }
 
   setIdle() {
@@ -181,14 +182,14 @@ export class NowPlayingPanel {
     this.update({
       track: null,
       album: null,
-      state: 'idle',
+      state: PlaybackState.IDLE,
       trackIndex: 0,
       totalTracks: 0
     });
   }
 
   setError(message) {
-    this.update({ state: 'error' });
+    this.update({ state: PlaybackState.ERROR });
   }
 
   setAlbum(album) {
