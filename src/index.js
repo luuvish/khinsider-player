@@ -1,54 +1,86 @@
 #!/usr/bin/env node
 
+// Suppress blessed tput warnings (stderr and stdout)
+const suppressPatterns = [
+  'xterm-256color',
+  'Error on',
+  'Setulc',
+  'stack.push',
+  'stack.pop',
+  'out.push',
+  '%p1%',
+  '\\u001b'
+];
+
+const shouldSuppress = (chunk) => {
+  if (typeof chunk !== 'string') return false;
+  return suppressPatterns.some(pattern => chunk.includes(pattern));
+};
+
+const originalStderrWrite = process.stderr.write.bind(process.stderr);
+process.stderr.write = (chunk, encoding, callback) => {
+  if (shouldSuppress(chunk)) return true;
+  return originalStderrWrite(chunk, encoding, callback);
+};
+
+const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = (chunk, encoding, callback) => {
+  if (shouldSuppress(chunk)) return true;
+  return originalStdoutWrite(chunk, encoding, callback);
+};
+
+import { initializeDatabase, closeDatabase } from './data/database.js';
+import { albumRepo } from './data/repositories/album-repo.js';
+import { trackRepo } from './data/repositories/track-repo.js';
 import KhinsiderScraper from './scraper.js';
-import MusicPlayer from './player.js';
-import PlaylistManager from './playlist.js';
-import FavoritesManager from './favorites.js';
-import UserInterface from './ui.js';
-import chalk from 'chalk';
+import { createPlaybackController } from './playback/controller.js';
+import { createDownloader } from './storage/downloader.js';
+import { App } from './tui/App.js';
 
 async function main() {
   try {
+    // Initialize database
+    initializeDatabase();
+
+    // Create scraper
     const scraper = new KhinsiderScraper();
-    const player = new MusicPlayer();
-    const playlist = new PlaylistManager();
-    const favorites = new FavoritesManager();
 
-    await favorites.initialize();
+    // Create playback controller
+    const playbackController = createPlaybackController(scraper);
 
-    player.on('error', (error) => {
-      console.error(chalk.red('Player error:'), error.message);
+    // Create downloader
+    const downloader = createDownloader(scraper);
+
+    // Create and initialize TUI app
+    const app = new App({
+      scraper,
+      playbackController,
+      albumRepo,
+      trackRepo,
+      downloader
     });
 
-    player.on('trackStart', (track) => {
-      if (track && track.name) {
-        console.log(chalk.dim(`Started: ${track.name}`));
-      }
+    // Handle graceful shutdown
+    const shutdown = async () => {
+      await playbackController.stop();
+      closeDatabase();
+      process.exit(0);
+    };
+
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    process.on('uncaughtException', () => {
+      shutdown();
     });
 
-    player.on('trackEnd', (track) => {
-      if (track && track.name) {
-        console.log(chalk.dim(`Finished: ${track.name}`));
-      }
-    });
-
-    const ui = new UserInterface(scraper, player, playlist, favorites);
-    await ui.start();
+    // Initialize and run app
+    await app.initialize();
+    app.run();
 
   } catch (error) {
-    console.error(chalk.red('Fatal error:'), error);
+    closeDatabase();
     process.exit(1);
   }
 }
-
-process.on('SIGINT', () => {
-  console.log(chalk.cyan('\n\nExiting Khinsider Player...\n'));
-  process.exit(0);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error(chalk.red('Uncaught exception:'), error);
-  process.exit(1);
-});
 
 main();

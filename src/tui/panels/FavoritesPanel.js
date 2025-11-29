@@ -1,0 +1,363 @@
+import blessed from 'blessed';
+import { trackRepo } from '../../data/repositories/track-repo.js';
+
+export class FavoritesPanel {
+  constructor(screen, options = {}) {
+    this.screen = screen;
+    this.onSelect = options.onSelect || (() => {});
+    this.onAlbumSelect = options.onAlbumSelect || (() => {});
+    this.albumRepo = options.albumRepo;
+
+    this.favorites = [];
+    this.tracks = {};  // albumId -> tracks[]
+    this.expandedAlbums = new Set();
+    this.expandedYears = new Set();
+
+    this.selectedAlbum = null;
+    this.cachedItems = [];
+
+    // Group by year
+    this.albumsByYear = {};  // year -> albums[]
+
+    this.createPanel();
+  }
+
+  createPanel() {
+    this.box = blessed.box({
+      parent: this.screen,
+      label: ' Favorites ',
+      top: 0,
+      left: '50%',
+      width: '50%',
+      height: '50%',
+      border: { type: 'line' },
+      style: {
+        border: { fg: 'yellow' },
+        label: { fg: 'white', bold: true }
+      }
+    });
+
+    this.list = blessed.list({
+      parent: this.box,
+      top: 0,
+      left: 0,
+      width: '100%-2',
+      height: '100%-2',
+      keys: false,
+      vi: false,
+      mouse: true,
+      scrollable: true,
+      alwaysScroll: true,
+      tags: true,
+      scrollbar: {
+        ch: '│',
+        track: { bg: 'gray' },
+        style: { bg: 'yellow' }
+      },
+      style: {
+        fg: 'white',
+        bg: 'default',
+        selected: { bg: 'blue', fg: 'white', bold: true }
+      },
+      items: []
+    });
+
+    this.setupEvents();
+  }
+
+  setupEvents() {
+    // Navigation
+    this.list.key(['j', 'down'], () => this.moveDown());
+    this.list.key(['k', 'up'], () => this.moveUp());
+    this.list.key(['g'], () => this.goToTop());
+    this.list.key(['S-g'], () => this.goToBottom());
+    this.list.key(['C-d'], () => this.pageDown());
+    this.list.key(['C-u'], () => this.pageUp());
+
+    // Expand/Collapse
+    this.list.key(['left', 'h'], () => this.collapse());
+    this.list.key(['right', 'l', 'enter'], () => this.expandOrSelect());
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Navigation
+  // ─────────────────────────────────────────────────────────────
+
+  selectAndScroll(index) {
+    if (index < 0 || index >= this.cachedItems.length) return;
+    this.list.selected = index;
+    this.adjustScrollMargin(index);
+    this.updateLabel();
+    this.screen.render();
+  }
+
+  adjustScrollMargin(index) {
+    const margin = 2;
+    const visibleHeight = Math.max(1, this.list.height - 2);
+    const scrollTop = this.list.childBase || 0;
+    const scrollBottom = scrollTop + visibleHeight - 1;
+
+    if (index < scrollTop + margin) {
+      this.list.childBase = Math.max(0, index - margin);
+    } else if (index > scrollBottom - margin) {
+      this.list.childBase = Math.max(0, index - visibleHeight + 1 + margin);
+    }
+  }
+
+  moveDown() {
+    const newIndex = Math.min(this.list.selected + 1, this.cachedItems.length - 1);
+    this.selectAndScroll(newIndex);
+  }
+
+  moveUp() {
+    const newIndex = Math.max(this.list.selected - 1, 0);
+    this.selectAndScroll(newIndex);
+  }
+
+  goToTop() {
+    this.selectAndScroll(0);
+  }
+
+  goToBottom() {
+    this.selectAndScroll(this.cachedItems.length - 1);
+  }
+
+  pageDown() {
+    const visibleHeight = Math.max(1, this.list.height - 2);
+    const halfPage = Math.floor(visibleHeight / 2);
+    const newIndex = Math.min(this.list.selected + halfPage, this.cachedItems.length - 1);
+    this.selectAndScroll(newIndex);
+  }
+
+  pageUp() {
+    const visibleHeight = Math.max(1, this.list.height - 2);
+    const halfPage = Math.floor(visibleHeight / 2);
+    const newIndex = Math.max(this.list.selected - halfPage, 0);
+    this.selectAndScroll(newIndex);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Expand / Collapse
+  // ─────────────────────────────────────────────────────────────
+
+  expandOrSelect() {
+    const index = this.list.selected;
+    const item = this.cachedItems[index];
+    if (!item) return;
+
+    if (item.type === 'track') {
+      // Play track
+      this.onSelect({
+        type: 'track',
+        track: item.track,
+        album: this.selectedAlbum,
+        trackIndex: item.trackIndex
+      });
+    } else if (item.type === 'year') {
+      this.toggleYear(item.year);
+    } else if (item.type === 'album') {
+      this.toggleAlbum(item.album);
+    }
+  }
+
+  collapse() {
+    const index = this.list.selected;
+    const item = this.cachedItems[index];
+    if (!item) return;
+
+    if (item.type === 'track') {
+      // Find parent album and collapse it
+      for (let i = index - 1; i >= 0; i--) {
+        if (this.cachedItems[i].type === 'album') {
+          const album = this.cachedItems[i].album;
+          this.expandedAlbums.delete(album.id);
+          this.selectedAlbum = null;
+          this.rebuildAndSelect(i);
+          return;
+        }
+      }
+    } else if (item.type === 'album') {
+      // If album is expanded, collapse it
+      if (this.expandedAlbums.has(item.album.id)) {
+        this.expandedAlbums.delete(item.album.id);
+        this.selectedAlbum = null;
+        this.rebuildAndSelect(index);
+        return;
+      }
+      // Otherwise find parent year and collapse it
+      for (let i = index - 1; i >= 0; i--) {
+        if (this.cachedItems[i].type === 'year') {
+          const year = this.cachedItems[i].year;
+          this.expandedYears.delete(year);
+          this.rebuildAndSelect(i);
+          return;
+        }
+      }
+    } else if (item.type === 'year') {
+      // Collapse year if expanded
+      if (this.expandedYears.has(item.year)) {
+        this.expandedYears.delete(item.year);
+        this.rebuildAndSelect(index);
+      }
+    }
+  }
+
+  toggleYear(year) {
+    const currentIndex = this.list.selected;
+    if (this.expandedYears.has(year)) {
+      this.expandedYears.delete(year);
+    } else {
+      this.expandedYears.add(year);
+    }
+    this.rebuildAndSelect(currentIndex);
+  }
+
+  toggleAlbum(album) {
+    const currentIndex = this.list.selected;
+    if (this.expandedAlbums.has(album.id)) {
+      this.expandedAlbums.delete(album.id);
+      this.selectedAlbum = null;
+    } else {
+      this.expandedAlbums.add(album.id);
+      this.selectedAlbum = album;
+      // Load tracks if not loaded
+      if (!this.tracks[album.id]) {
+        const tracks = trackRepo.getByAlbumId(album.id);
+        this.tracks[album.id] = tracks;
+      }
+      this.onAlbumSelect(album);
+    }
+    this.rebuildAndSelect(currentIndex);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Data
+  // ─────────────────────────────────────────────────────────────
+
+  refresh() {
+    if (!this.albumRepo) return;
+
+    this.favorites = this.albumRepo.getFavorites();
+
+    // Group albums by year
+    this.albumsByYear = {};
+    for (const album of this.favorites) {
+      const year = album.year || 'Unknown';
+      if (!this.albumsByYear[year]) {
+        this.albumsByYear[year] = [];
+      }
+      this.albumsByYear[year].push(album);
+    }
+
+    // Sort years descending
+    const years = Object.keys(this.albumsByYear).sort((a, b) => {
+      if (a === 'Unknown') return 1;
+      if (b === 'Unknown') return -1;
+      return b.localeCompare(a);
+    });
+
+    // Rebuild with sorted years
+    const sortedAlbumsByYear = {};
+    for (const year of years) {
+      sortedAlbumsByYear[year] = this.albumsByYear[year];
+    }
+    this.albumsByYear = sortedAlbumsByYear;
+
+    this.buildItems();
+    this.render();
+  }
+
+  buildItems() {
+    this.cachedItems = [];
+
+    for (const year of Object.keys(this.albumsByYear)) {
+      const albums = this.albumsByYear[year];
+      const isExpanded = this.expandedYears.has(year);
+      const prefix = isExpanded ? '▼' : '▶';
+
+      this.cachedItems.push({
+        type: 'year',
+        year: year,
+        text: `${prefix} ${year} (${albums.length} albums)`
+      });
+
+      if (isExpanded) {
+        for (const album of albums) {
+          const isAlbumExpanded = this.expandedAlbums.has(album.id);
+          const albumPrefix = isAlbumExpanded ? '  ▼' : '  ▶';
+          const downloadStatus = album.is_downloaded ? ' ✓' : '';
+
+          this.cachedItems.push({
+            type: 'album',
+            album: album,
+            text: `${albumPrefix} ${album.title}${downloadStatus}`
+          });
+
+          if (isAlbumExpanded && this.tracks[album.id]) {
+            for (let i = 0; i < this.tracks[album.id].length; i++) {
+              const track = this.tracks[album.id][i];
+              const num = String(i + 1).padStart(2, '0');
+              this.cachedItems.push({
+                type: 'track',
+                track: track,
+                trackIndex: i,
+                text: `      ${num}. ${track.name}`
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  rebuildAndSelect(targetIndex) {
+    this.buildItems();
+    this.list.setItems(this.cachedItems.map(i => i.text));
+
+    const newIndex = Math.min(Math.max(0, targetIndex), this.cachedItems.length - 1);
+    if (this.cachedItems.length > 0) {
+      this.list.selected = newIndex;
+      this.adjustScrollMargin(newIndex);
+    }
+    this.updateLabel();
+    this.screen.render();
+  }
+
+  render() {
+    this.list.setItems(this.cachedItems.map(i => i.text));
+    if (this.cachedItems.length > 0 && this.list.selected >= this.cachedItems.length) {
+      this.list.selected = this.cachedItems.length - 1;
+    }
+    this.updateLabel();
+    this.screen.render();
+  }
+
+  updateLabel() {
+    const count = this.favorites.length;
+    this.box.setLabel(` Favorites (${count}) `);
+  }
+
+  getSelectedItem() {
+    const index = this.list.selected;
+    return this.cachedItems[index] || null;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Public API
+  // ─────────────────────────────────────────────────────────────
+
+  focus() {
+    this.list.focus();
+    this.box.style.border.fg = 'white';
+    this.screen.render();
+  }
+
+  blur() {
+    this.box.style.border.fg = 'yellow';
+    this.screen.render();
+  }
+
+  getBox() {
+    return this.box;
+  }
+}

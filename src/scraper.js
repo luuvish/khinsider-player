@@ -1,10 +1,22 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import { wrapper } from 'axios-cookiejar-support';
+import { CookieJar } from 'tough-cookie';
 
 class KhinsiderScraper {
   constructor() {
     this.baseUrl = 'https://downloads.khinsider.com';
+    this.forumUrl = 'https://downloads.khinsider.com/forums';
     this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+    // Cookie jar for session management
+    this.cookieJar = new CookieJar();
+    this.client = wrapper(axios.create({
+      jar: this.cookieJar,
+      withCredentials: true
+    }));
+
+    this.isLoggedIn = false;
   }
 
   async makeRequest(url, options = {}) {
@@ -19,17 +31,184 @@ class KhinsiderScraper {
       'Referer': this.baseUrl
     };
 
-    return await axios.get(url, {
+    return await this.client.get(url, {
       headers: { ...defaultHeaders, ...options.headers },
       timeout: 30000,
       ...options
     });
   }
 
+  async makePost(url, data, options = {}) {
+    const defaultHeaders = {
+      'User-Agent': this.userAgent,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Referer': this.forumUrl + '/index.php?login/'
+    };
+
+    return await this.client.post(url, data, {
+      headers: { ...defaultHeaders, ...options.headers },
+      timeout: 30000,
+      maxRedirects: 5,
+      ...options
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Authentication
+  // ─────────────────────────────────────────────────────────────
+
+  async login(username, password) {
+    try {
+      // Step 1: Get login page to get CSRF token
+      const loginPageUrl = `${this.forumUrl}/index.php?login/`;
+      const loginPage = await this.makeRequest(loginPageUrl);
+      const $ = cheerio.load(loginPage.data);
+
+      // Extract CSRF token
+      const csrfToken = $('input[name="_xfToken"]').val();
+      if (!csrfToken) {
+        throw new Error('Could not find CSRF token');
+      }
+
+      // Step 2: Submit login form
+      const loginData = new URLSearchParams({
+        login: username,
+        password: password,
+        remember: '1',
+        _xfToken: csrfToken,
+        _xfRedirect: this.baseUrl
+      });
+
+      const response = await this.makePost(
+        `${this.forumUrl}/index.php?login/login`,
+        loginData.toString()
+      );
+
+      // Check if login was successful by looking for error messages or user elements
+      const $response = cheerio.load(response.data);
+      const hasError = $response('.blockMessage--error').length > 0;
+      const isLoggedIn = $response('a[href*="logout"]').length > 0 ||
+                         response.data.includes('data-logged-in="true"');
+
+      if (hasError) {
+        const errorMsg = $response('.blockMessage--error').text().trim();
+        throw new Error(errorMsg || 'Login failed');
+      }
+
+      this.isLoggedIn = isLoggedIn;
+      return { success: isLoggedIn };
+
+    } catch (error) {
+      this.isLoggedIn = false;
+      throw error;
+    }
+  }
+
+  async checkLoginStatus() {
+    try {
+      const response = await this.makeRequest(`${this.forumUrl}/`);
+      const isLoggedIn = response.data.includes('data-logged-in="true"');
+      this.isLoggedIn = isLoggedIn;
+      return isLoggedIn;
+    } catch {
+      return false;
+    }
+  }
+
+  async logout() {
+    this.cookieJar = new CookieJar();
+    this.client = wrapper(axios.create({
+      jar: this.cookieJar,
+      withCredentials: true
+    }));
+    this.isLoggedIn = false;
+  }
+
+  // Get album download ID from album page (for bulk download)
+  async getAlbumDownloadId(albumUrl) {
+    try {
+      const response = await this.makeRequest(albumUrl);
+      const $ = cheerio.load(response.data);
+
+      // Look for the bulk download link: /cp/add_album/{id}
+      const downloadLink = $('a[href*="/cp/add_album/"]').attr('href');
+      if (downloadLink) {
+        const match = downloadLink.match(/\/cp\/add_album\/(\d+)/);
+        if (match) {
+          return match[1];
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Get bulk download URLs for MP3 and FLAC (from album page)
+  async getBulkDownloadUrls(albumUrl) {
+    try {
+      const response = await this.makeRequest(albumUrl);
+      const $ = cheerio.load(response.data);
+
+      const urls = { mp3Url: null, flacUrl: null };
+
+      // First, look for direct .zip links on the page
+      $('a[href*=".zip"]').each((_, el) => {
+        const href = $(el).attr('href');
+        const text = $(el).text().toLowerCase();
+
+        if (!href) return;
+
+        const fullUrl = href.startsWith('http') ? href : this.baseUrl + href;
+
+        if (text.includes('flac') || href.includes('flac')) {
+          urls.flacUrl = fullUrl;
+        } else if (text.includes('mp3') || href.includes('mp3')) {
+          urls.mp3Url = fullUrl;
+        }
+      });
+
+      // If no direct ZIP links, try the /cp/add_album/ link (requires login)
+      if (!urls.mp3Url && !urls.flacUrl) {
+        const addAlbumLink = $('a[href*="/cp/add_album/"]').attr('href');
+        if (addAlbumLink) {
+          const addAlbumUrl = addAlbumLink.startsWith('http') ? addAlbumLink : this.baseUrl + addAlbumLink;
+
+          // Follow the add_album link to get to download page
+          const downloadPageResponse = await this.makeRequest(addAlbumUrl);
+          const $dl = cheerio.load(downloadPageResponse.data);
+
+          // Look for ZIP links on the download page
+          $dl('a[href*=".zip"]').each((_, el) => {
+            const href = $dl(el).attr('href');
+            const text = $dl(el).text().toLowerCase();
+
+            if (!href) return;
+
+            const fullUrl = href.startsWith('http') ? href : this.baseUrl + href;
+
+            if (text.includes('flac') || href.includes('flac')) {
+              urls.flacUrl = fullUrl;
+            } else if (text.includes('mp3') || href.includes('mp3')) {
+              urls.mp3Url = fullUrl;
+            } else if (!urls.mp3Url) {
+              // Fallback: use first zip link as mp3
+              urls.mp3Url = fullUrl;
+            }
+          });
+        }
+      }
+
+      return urls;
+    } catch (error) {
+      throw error;
+    }
+  }
+
   async searchAlbums(query) {
     try {
-      console.log(`🔍 Searching for: "${query}"`);
-      
       const response = await this.makeRequest(`${this.baseUrl}/search`, {
         params: { search: query }
       });
@@ -78,59 +257,171 @@ class KhinsiderScraper {
           });
         }
       });
-      
-      console.log(`✅ Found ${albums.length} albums`);
+
       return albums;
-      
+
     } catch (error) {
-      console.error('❌ Error searching albums:', error.message);
       return [];
+    }
+  }
+
+  async getAlbumInfo(albumUrl) {
+    try {
+      const response = await this.makeRequest(albumUrl);
+      const $ = cheerio.load(response.data);
+
+      const info = {
+        images: [],
+        metadata: {}
+      };
+
+      // Get album images from various sources
+      const imageSet = new Set();
+
+      // Album art links - look for links to actual album images (vgmtreasurechest domain)
+      $('a[href$=".jpg"], a[href$=".png"], a[href$=".gif"], a[href$=".jpeg"]').each((_, el) => {
+        const href = $(el).attr('href');
+        if (href) {
+          // Only include album art from vgmtreasurechest (actual album images)
+          if (href.includes('vgmtreasurechest.com') || href.includes('/soundtracks/')) {
+            const fullUrl = href.startsWith('http') ? href : this.baseUrl + href;
+            // Exclude thumbs
+            if (!fullUrl.includes('/thumbs/')) {
+              imageSet.add(fullUrl);
+            }
+          }
+        }
+      });
+
+      info.images = Array.from(imageSet);
+
+      // Get metadata - preserve original format as array of {label, value}
+      info.metadataLines = [];
+
+      // Find the info section (between title and images/songlist)
+      const pageContent = $('#pageContent');
+
+      // Platform(s)
+      const platformLinks = pageContent.find('a[href*="/browse/"], a[href*="/pc-"], a[href*="/nintendo-"], a[href*="/playstation-"], a[href*="/xbox-"], a[href*="/sega-"]');
+      const platforms = [];
+      platformLinks.each((_, el) => {
+        const text = $(el).text().trim();
+        if (text && !platforms.includes(text)) {
+          platforms.push(text);
+        }
+      });
+      if (platforms.length > 0) {
+        info.metadataLines.push({ label: 'Platforms', value: platforms.join(', ') });
+      }
+
+      const text = pageContent.text();
+
+      // Year
+      const yearMatch = text.match(/Year:\s*(\d{4})/i);
+      if (yearMatch) {
+        info.metadataLines.push({ label: 'Year', value: yearMatch[1] });
+      }
+
+      // Catalog Number
+      const catalogMatch = text.match(/Catalog(?:\s*Number)?:\s*([^\n]+?)(?=\s*(?:Published|Developed|Number|Total|Date|Album|$))/i);
+      if (catalogMatch) {
+        info.metadataLines.push({ label: 'Catalog', value: catalogMatch[1].trim() });
+      }
+
+      // Developer
+      const developerLink = pageContent.find('a[href*="/developer/"]').first();
+      if (developerLink.length) {
+        info.metadataLines.push({ label: 'Developer', value: developerLink.text().trim() });
+      }
+
+      // Publisher
+      const publisherLink = pageContent.find('a[href*="/publisher/"]').first();
+      if (publisherLink.length) {
+        info.metadataLines.push({ label: 'Publisher', value: publisherLink.text().trim() });
+      }
+
+      // Number of Files
+      const filesMatch = text.match(/Number of Files:\s*(\d+)/i);
+      if (filesMatch) {
+        info.metadataLines.push({ label: 'Files', value: filesMatch[1] });
+      }
+
+      // Total Filesize
+      const sizeMatch = text.match(/Total Filesize:\s*([^\n]+?)(?=\s*Date|\s*Album|\s*$)/i);
+      if (sizeMatch) {
+        info.metadataLines.push({ label: 'Size', value: sizeMatch[1].trim() });
+      }
+
+      // Date Added
+      const dateMatch = text.match(/Date Added:\s*([A-Za-z]+ \d+[a-z]*, \d{4})/i);
+      if (dateMatch) {
+        info.metadataLines.push({ label: 'Added', value: dateMatch[1] });
+      }
+
+      // Album Type
+      const typeLink = pageContent.find('a[href*="/ost"], a[href*="/gamerip"]').first();
+      if (typeLink.length) {
+        info.metadataLines.push({ label: 'Type', value: typeLink.text().trim() });
+      }
+
+      return info;
+
+    } catch (error) {
+      return { images: [], metadata: {} };
     }
   }
 
   async getAlbumTracks(albumUrl) {
     try {
-      console.log(`🎵 Fetching tracks from: ${albumUrl}`);
-      
       const response = await this.makeRequest(albumUrl);
       const $ = cheerio.load(response.data);
       const tracks = [];
-      
+
+      // Detect if this is a multi-disc album by checking header row
+      const headerRow = $('#songlist tr').first();
+      const headers = headerRow.find('th');
+      let hasDiscColumn = false;
+
+      headers.each((_, th) => {
+        const text = $(th).text().trim().toLowerCase();
+        if (text === 'cd' || text === 'disc') {
+          hasDiscColumn = true;
+        }
+      });
+
+      // Column indices based on structure
+      // Single disc: [play] [#] [name] [duration] [mp3] [flac] [download] [playlist]
+      // Multi disc:  [play] [cd] [#] [name] [duration] [mp3] [flac] [download] [playlist]
+      const nameIdx = hasDiscColumn ? 3 : 2;
+      const durationIdx = hasDiscColumn ? 4 : 3;
+      const mp3Idx = hasDiscColumn ? 5 : 4;
+      const flacIdx = hasDiscColumn ? 6 : 5;
+
       // Target the songlist table - process all rows except header
       $('#songlist tr').each((index, element) => {
         const $row = $(element);
         const cells = $row.find('td');
-        
+
         // Skip header row (has th elements) or rows without enough cells
         if (cells.length < 5) return;
-        
-        // Based on the debug output, the structure is:
-        // Cell 0: Play button (empty)
-        // Cell 1: Track number
-        // Cell 2: Track name with link
-        // Cell 3: Duration with link
-        // Cell 4: MP3 size with link
-        // Cell 5: FLAC size (optional)
-        // Cell 6: Download icon
-        // Cell 7: Playlist icon
-        
-        const trackNameCell = cells.eq(2);
-        const durationCell = cells.eq(3);
-        const mp3SizeCell = cells.eq(4);
-        const flacSizeCell = cells.eq(5);
-        
+
+        const trackNameCell = cells.eq(nameIdx);
+        const durationCell = cells.eq(durationIdx);
+        const mp3SizeCell = cells.eq(mp3Idx);
+        const flacSizeCell = cells.eq(flacIdx);
+
         // Get track name - it's in a link
         const trackLink = trackNameCell.find('a').first();
         const trackName = trackLink.text().trim() || trackNameCell.text().trim();
         const trackHref = trackLink.attr('href');
-        
+
         // Get duration
         const duration = durationCell.find('a').text().trim() || durationCell.text().trim();
-        
+
         // Get file sizes
         const mp3Size = mp3SizeCell.find('a').text().trim() || mp3SizeCell.text().trim();
         const flacSize = flacSizeCell.find('a').text().trim() || flacSizeCell.text().trim();
-        
+
         if (trackName && trackHref) {
           tracks.push({
             name: trackName,
@@ -143,17 +434,14 @@ class KhinsiderScraper {
           });
         }
       });
-      
-      console.log(`✅ Found ${tracks.length} tracks`);
+
       return tracks;
-      
+
     } catch (error) {
-      console.error('❌ Error fetching album tracks:', error.message);
       return [];
     }
   }
 
-  // For cases where we need to extract actual download URLs from track pages
   async getTrackDirectUrl(trackPageUrl) {
     try {
       const response = await this.makeRequest(trackPageUrl);
@@ -189,69 +477,133 @@ class KhinsiderScraper {
         mp3: mp3Url,
         flac: flacUrl
       };
-      
+
     } catch (error) {
-      console.error('❌ Error fetching track URL:', error.message);
       return { mp3: null, flac: null };
+    }
+  }
+
+  async getYears() {
+    try {
+      const response = await this.makeRequest(`${this.baseUrl}/album-years`);
+      const $ = cheerio.load(response.data);
+      const years = [];
+
+      // Find year links on the page
+      $('a[href*="/game-soundtracks/year/"]').each((_, element) => {
+        const $link = $(element);
+        const href = $link.attr('href');
+        const text = $link.text().trim();
+
+        // Extract year from href or text
+        const yearMatch = href.match(/\/year\/(\d{4})\/?$/);
+        if (yearMatch) {
+          const year = yearMatch[1];
+          if (!years.includes(year)) {
+            years.push(year);
+          }
+        }
+      });
+
+      // Sort years descending (newest first), but keep 0000 at the end
+      years.sort((a, b) => {
+        if (a === '0000') return 1;
+        if (b === '0000') return -1;
+        return b.localeCompare(a);
+      });
+
+      return years;
+
+    } catch (error) {
+      return [];
     }
   }
 
   async getAlbumsByYear(year) {
     try {
-      console.log(`📅 Fetching albums from year ${year}...`);
-      
-      const response = await this.makeRequest(`${this.baseUrl}/game-soundtracks/year/${year}/`);
-      const $ = cheerio.load(response.data);
       const albums = [];
-      
-      $('table.albumList tbody tr').each((index, element) => {
-        const $row = $(element);
-        const cells = $row.find('td');
-        
-        if (cells.length < 2) return;
-        
-        const albumLinks = $row.find('a[href*="/game-soundtracks/album/"]');
-        
-        let bestLink = null;
-        let bestTitle = '';
-        
-        albumLinks.each((i, link) => {
-          const $link = $(link);
-          const text = $link.text().trim();
-          
-          if (text && text.length > bestTitle.length) {
-            bestLink = $link;
-            bestTitle = text;
+      let page = 1;
+
+      while (true) {
+        const url = page === 1
+          ? `${this.baseUrl}/game-soundtracks/year/${year}/`
+          : `${this.baseUrl}/game-soundtracks/year/${year}?page=${page}`;
+
+        const response = await this.makeRequest(url);
+        const $ = cheerio.load(response.data);
+        const pageAlbums = [];
+
+        // Try both tbody tr and direct tr (different page structures)
+        $('table.albumList tr').each((index, element) => {
+          const $row = $(element);
+          const cells = $row.find('td');
+
+          // Skip header rows
+          if (cells.length === 0) return;
+
+          const albumLinks = $row.find('a[href*="/game-soundtracks/album/"]');
+
+          let bestLink = null;
+          let bestTitle = '';
+
+          albumLinks.each((i, link) => {
+            const $link = $(link);
+            const text = $link.text().trim();
+
+            // Skip image-only links (no text)
+            if (text && text.length > bestTitle.length) {
+              bestLink = $link;
+              bestTitle = text;
+            }
+          });
+
+          if (bestLink && bestTitle) {
+            // Platform may be in second cell, or not present
+            const platform = cells.length >= 2 ? cells.eq(1).text().trim() : '';
+
+            pageAlbums.push({
+              title: bestTitle,
+              url: this.baseUrl + bestLink.attr('href'),
+              platform: platform || 'Unknown',
+              year: year
+            });
           }
         });
-        
-        if (bestLink && bestTitle) {
-          const platform = cells.eq(1).text().trim() || 'Unknown';
-          
-          albums.push({
-            title: bestTitle,
-            url: this.baseUrl + bestLink.attr('href'),
-            platform: platform
-          });
+
+        // No albums on this page - stop
+        if (pageAlbums.length === 0) {
+          break;
         }
-      });
-      
+
+        albums.push(...pageAlbums);
+
+        // Check for next page link (various formats)
+        const hasNextPage =
+          $(`a[href*="year/${year}?page=${page + 1}"]`).length > 0 ||
+          $(`a[href*="year/${year}/?page=${page + 1}"]`).length > 0 ||
+          $(`.pagination a:contains("${page + 1}")`).length > 0 ||
+          $(`.pagination a:contains("Next")`).length > 0 ||
+          $(`.pagination a:contains(">")`).length > 0;
+
+        if (!hasNextPage) {
+          break;
+        }
+
+        page++;
+      }
+
       // Sort albums alphabetically by title
       albums.sort((a, b) => a.title.localeCompare(b.title));
-      
-      console.log(`✅ Found ${albums.length} albums from ${year}`);
+
       return albums;
-      
+
     } catch (error) {
-      console.error(`❌ Error fetching albums for year ${year}:`, error.message);
       return [];
     }
   }
 
   async getRecentAlbums() {
     try {
-      console.log('🕒 Fetching recent albums...');
-      
       const response = await this.makeRequest(this.baseUrl);
       const $ = cheerio.load(response.data);
       const albums = [];
@@ -268,118 +620,12 @@ class KhinsiderScraper {
           });
         }
       });
-      
-      console.log(`✅ Found ${albums.length} recent albums`);
+
       return albums.slice(0, 20);
-      
+
     } catch (error) {
-      console.error('❌ Error fetching recent albums:', error.message);
       return [];
     }
-  }
-
-  // Test method to validate a track's download URL
-  async testTrackDownload(track) {
-    console.log(`\n🧪 Testing track download: "${track.name}"`);
-    
-    const urlsToTest = [
-      { name: 'Direct MP3 URL', url: track.directMp3Url },
-      { name: 'Decoded MP3 URL', url: track.decodedMp3Url }
-    ];
-    
-    for (const urlTest of urlsToTest) {
-      try {
-        console.log(`   Testing ${urlTest.name}: ${urlTest.url}`);
-        
-        const headResponse = await axios.head(urlTest.url, {
-          headers: { 
-            'User-Agent': this.userAgent,
-            'Referer': this.baseUrl
-          },
-          timeout: 10000
-        });
-        
-        console.log(`   ✅ ${urlTest.name} works!`);
-        console.log(`      Status: ${headResponse.status}`);
-        console.log(`      Content-Type: ${headResponse.headers['content-type']}`);
-        console.log(`      Content-Length: ${headResponse.headers['content-length']} bytes`);
-        
-        // If we get an audio content type, this URL is good
-        if (headResponse.headers['content-type'] && headResponse.headers['content-type'].includes('audio')) {
-          return { success: true, url: urlTest.url, type: urlTest.name };
-        }
-        
-      } catch (error) {
-        console.log(`   ❌ ${urlTest.name} failed: ${error.message}`);
-      }
-    }
-    
-    return { success: false, url: null, type: null };
-  }
-
-  // Comprehensive test method
-  async runComprehensiveTest(searchTerm = 'mario') {
-    console.log('🚀 COMPREHENSIVE KHINSIDER SCRAPER TEST');
-    console.log('=======================================\n');
-    
-    // Step 1: Test search
-    const albums = await this.searchAlbums(searchTerm);
-    if (albums.length === 0) {
-      console.log('❌ Search failed, cannot continue tests');
-      return;
-    }
-    
-    console.log(`\n📋 Top 3 search results for "${searchTerm}":`);
-    albums.slice(0, 3).forEach((album, i) => {
-      console.log(`  ${i + 1}. "${album.title}" (${album.platform}, ${album.year})`);
-    });
-    
-    // Step 2: Test track extraction with first album
-    const testAlbum = albums[0];
-    console.log(`\n🎵 Testing track extraction with: "${testAlbum.title}"`);
-    
-    const tracks = await this.getAlbumTracks(testAlbum.url);
-    if (tracks.length === 0) {
-      console.log('❌ No tracks found in first album, trying second album...');
-      
-      if (albums.length > 1) {
-        const secondAlbum = albums[1];
-        const secondTracks = await this.getAlbumTracks(secondAlbum.url);
-        if (secondTracks.length > 0) {
-          console.log(`✅ Found ${secondTracks.length} tracks in second album`);
-          tracks.push(...secondTracks.slice(0, 2)); // Add first 2 tracks for testing
-        }
-      }
-    }
-    
-    // Step 3: Test download URLs
-    if (tracks.length > 0) {
-      console.log(`\n🔗 Testing download URLs (first track):`);
-      const testResult = await this.testTrackDownload(tracks[0]);
-      
-      if (testResult.success) {
-        console.log(`✅ Found working download URL: ${testResult.url}`);
-      } else {
-        console.log('❌ No working download URLs found');
-      }
-    }
-    
-    // Step 4: Test recent albums
-    const recentAlbums = await this.getRecentAlbums();
-    
-    console.log('\n📊 TEST SUMMARY');
-    console.log('===============');
-    console.log(`Search results: ${albums.length} albums`);
-    console.log(`Track extraction: ${tracks.length} tracks`);
-    console.log(`Recent albums: ${recentAlbums.length} albums`);
-    console.log('\n✅ Comprehensive test completed!');
-    
-    return {
-      searchResults: albums.length,
-      tracksFound: tracks.length,
-      recentAlbums: recentAlbums.length,
-      testResults: { albums, tracks, recentAlbums }
-    };
   }
 }
 
