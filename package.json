@@ -2,11 +2,33 @@
   "name": "khinsider-player",
   "version": "2.0.0",
   "description": "A TUI music player for video game soundtracks from khinsider.com",
-  "main": "src/index.js",
+  "main": "dist/index.js",
+  "bin": {
+    "khinsider-player": "dist/index.js"
+  },
   "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "author": "luuvish@gmail.com",
+  "license": "MIT",
+  "keywords": [
+    "music",
+    "player",
+    "khinsider",
+    "video-game-music",
+    "tui"
+  ],
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "lint:fix": "eslint src --fix"
   },
   "dependencies": {
     "axios": "^1.6.0",
@@ -19,13 +41,16 @@
     "fs-extra": "^11.2.0",
     "tough-cookie": "^6.0.0"
   },
-  "keywords": [
-    "music",
-    "player",
-    "khinsider",
-    "video-game-music",
-    "tui"
-  ],
-  "author": "luuvish@gmail.com",
-  "license": "MIT"
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/blessed": "^0.1.26",
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^24.10.1",
+    "eslint": "^9.39.1",
+    "tsup": "^8.5.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.0"
+  }
 }

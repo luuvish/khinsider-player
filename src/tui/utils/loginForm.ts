@@ -1,17 +1,19 @@
 import blessed from 'blessed';
 
+interface LoginFormOptions {
+  screen: blessed.Widgets.Screen;
+  title?: string;
+  subtitle?: string;
+  credentials?: { username?: string; password?: string };
+  onSubmit?: (username: string, password: string) => void | Promise<void>;
+  onCancel?: () => void;
+  setDialogActive?: (active: boolean) => void;
+}
+
 /**
  * Creates a reusable login form dialog
- * @param {Object} options
- * @param {Object} options.screen - blessed screen instance
- * @param {string} options.title - Dialog title
- * @param {string} options.subtitle - Optional subtitle text
- * @param {Object} options.credentials - Initial credentials { username, password }
- * @param {Function} options.onSubmit - Callback(username, password) when form is submitted
- * @param {Function} options.onCancel - Callback when form is cancelled
- * @param {Function} options.setDialogActive - Callback to set dialog active state
  */
-export function showLoginForm(options) {
+export function showLoginForm(options: LoginFormOptions) {
   const {
     screen,
     title = 'Login',
@@ -87,6 +89,11 @@ export function showLoginForm(options) {
     setDialogActive(true);
   }
 
+  // Store escape key handler reference for proper cleanup
+  const escapeHandler = () => {
+    cancel();
+  };
+
   const cleanup = () => {
     if (isCleanedUp) return;
     isCleanedUp = true;
@@ -95,6 +102,9 @@ export function showLoginForm(options) {
     usernameInput.removeAllListeners();
     passwordInput.removeAllListeners();
     dialogBox.removeAllListeners();
+
+    // Remove key handlers (not covered by removeAllListeners)
+    dialogBox.unkey('escape', escapeHandler);
 
     if (setDialogActive) {
       setDialogActive(false);
@@ -111,14 +121,18 @@ export function showLoginForm(options) {
     if (onSubmit) {
       try {
         const result = onSubmit(username, password);
-        // Handle async callbacks
+        // Handle async callbacks - errors are handled by the caller's try-catch
+        // but we need to prevent unhandled rejection warnings
         if (result && typeof result.catch === 'function') {
-          result.catch(() => {
-            // Errors handled by caller
+          result.catch((error: unknown) => {
+            // Error should already be handled by caller's try-catch in onSubmit
+            // This catch prevents unhandled promise rejection warning
+            console.error('Login form submit error:', error instanceof Error ? error.message : error);
           });
         }
-      } catch {
-        // Errors handled by caller
+      } catch (error: unknown) {
+        // Sync errors - log for debugging
+        console.error('Login form submit error:', error instanceof Error ? error.message : error);
       }
     }
   };
@@ -191,10 +205,8 @@ export function showLoginForm(options) {
     }
   });
 
-  // Escape key on dialog
-  dialogBox.key(['escape'], () => {
-    cancel();
-  });
+  // Escape key on dialog (using stored handler for proper cleanup)
+  dialogBox.key(['escape'], escapeHandler);
 
   screen.render();
   focusUsername();

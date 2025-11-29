@@ -1,15 +1,35 @@
 import { EventEmitter } from 'events';
-import { spawn } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs-extra';
 import axios from 'axios';
 import os from 'os';
+import type { TrackInfo } from '../types/index.js';
 
 const TEMP_DIR = path.join(os.tmpdir(), 'khinsider-player');
 const PROCESS_KILL_TIMEOUT = 2000; // 2 seconds for graceful shutdown
 const MIN_AUDIO_FILE_SIZE = 1024; // Minimum 1KB for valid audio file
 
+interface PlayerCommand {
+  cmd: string;
+  args: string[];
+}
+
+interface PlayerStatus {
+  isPlaying: boolean;
+  isPaused: boolean;
+  currentTrack: TrackInfo | null;
+}
+
 export class AudioPlayer extends EventEmitter {
+  currentProcess: ChildProcess | null;
+  currentTrack: TrackInfo | null;
+  isPlaying: boolean;
+  isPaused: boolean;
+  tempFile: string | null;
+  playLock: boolean;
+  isStopping: boolean;
+
   constructor() {
     super();
     this.currentProcess = null;
@@ -21,11 +41,11 @@ export class AudioPlayer extends EventEmitter {
     this.isStopping = false; // Flag to prevent race conditions
   }
 
-  async ensureTempDir() {
+  async ensureTempDir(): Promise<void> {
     await fs.ensureDir(TEMP_DIR);
   }
 
-  getPlayerCommand() {
+  getPlayerCommand(): PlayerCommand {
     const platform = process.platform;
     if (platform === 'darwin') {
       return { cmd: 'afplay', args: [] };
@@ -38,12 +58,13 @@ export class AudioPlayer extends EventEmitter {
   }
 
   // Sanitize path for Windows PowerShell to prevent command injection
-  sanitizeWindowsPath(filePath) {
+  sanitizeWindowsPath(filePath: string): string {
     // Only allow valid path characters, reject anything suspicious
     const normalized = path.normalize(filePath);
 
     // Check for suspicious patterns - block shell metacharacters
     // Including: ; & | ` $ ( ) { } < > @ # and null bytes
+    // eslint-disable-next-line no-control-regex
     if (/[;&|`$(){}<>@#\x00]/.test(normalized)) {
       throw new Error('Invalid characters in file path');
     }
@@ -57,7 +78,12 @@ export class AudioPlayer extends EventEmitter {
     return normalized.replace(/'/g, "''");
   }
 
-  async downloadToTemp(url) {
+  async downloadToTemp(url: string): Promise<string> {
+    // Validate URL
+    if (!url || typeof url !== 'string') {
+      throw new Error('Invalid URL for download');
+    }
+
     await this.ensureTempDir();
     const tempFile = path.join(TEMP_DIR, `track-${Date.now()}.mp3`);
 
@@ -94,13 +120,20 @@ export class AudioPlayer extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      let streamsDestroyed = false;
 
-      const cleanup = async (error) => {
+      // Centralized stream cleanup with duplicate call protection
+      const destroyStreams = () => {
+        if (streamsDestroyed) return;
+        streamsDestroyed = true;
+        try { response.data.destroy(); } catch { /* ignore */ }
+        try { writer.destroy(); } catch { /* ignore */ }
+      };
+
+      const cleanup = async (error: Error | null) => {
         if (settled) return;
         settled = true;
-        // Destroy both streams to prevent leaks
-        response.data.destroy();
-        writer.destroy();
+        destroyStreams();
         await fs.remove(tempFile).catch(() => {});
         if (error) {
           reject(error);
@@ -109,7 +142,9 @@ export class AudioPlayer extends EventEmitter {
 
       // Handle stream errors
       response.data.on('error', (err) => {
-        cleanup(new Error(`Download stream error: ${err.message}`)).catch(() => {});
+        cleanup(new Error(`Download stream error: ${err.message}`)).catch((cleanupErr) => {
+          console.error('Cleanup error during stream error handling:', cleanupErr);
+        });
       });
 
       response.data.on('data', (chunk) => {
@@ -124,9 +159,7 @@ export class AudioPlayer extends EventEmitter {
 
         // Validate file size
         if (downloadedBytes < MIN_AUDIO_FILE_SIZE) {
-          // Destroy streams before rejecting to prevent resource leak
-          response.data.destroy();
-          writer.destroy();
+          destroyStreams();
           await fs.remove(tempFile).catch(() => {});
           reject(new Error('Downloaded file too small, possibly corrupted'));
           return;
@@ -134,9 +167,7 @@ export class AudioPlayer extends EventEmitter {
 
         // Verify content-length if provided
         if (contentLength > 0 && downloadedBytes < contentLength * 0.9) {
-          // Destroy streams before rejecting to prevent resource leak
-          response.data.destroy();
-          writer.destroy();
+          destroyStreams();
           await fs.remove(tempFile).catch(() => {});
           reject(new Error('Download incomplete'));
           return;
@@ -146,12 +177,19 @@ export class AudioPlayer extends EventEmitter {
       });
 
       writer.on('error', (err) => {
-        cleanup(err);
+        cleanup(err).catch((cleanupErr) => {
+          console.error('Cleanup error during writer error handling:', cleanupErr);
+        });
       });
     });
   }
 
-  async play(source, trackInfo = {}) {
+  async play(source: string, trackInfo: TrackInfo = { name: '' }): Promise<boolean> {
+    // Validate source parameter
+    if (!source || typeof source !== 'string') {
+      return Promise.reject(new Error('Invalid audio source'));
+    }
+
     // Prevent concurrent plays - return rejected promise instead of false
     if (this.playLock) {
       return Promise.reject(new Error('Playback already in progress'));
@@ -176,7 +214,7 @@ export class AudioPlayer extends EventEmitter {
         try {
           audioPath = await this.downloadToTemp(source);
           this.tempFile = audioPath;
-        } catch (error) {
+        } catch (error: unknown) {
           this.currentTrack = null; // Reset on error
           this.emit('error', { track: trackInfo, error });
           throw error;
@@ -208,7 +246,7 @@ export class AudioPlayer extends EventEmitter {
             '-Command',
             `Add-Type -AssemblyName presentationCore; $player = New-Object System.Windows.Media.MediaPlayer; $player.Open([uri]'${safePath}'); $player.Play(); while($player.NaturalDuration.HasTimeSpan -eq $false -or $player.Position -lt $player.NaturalDuration.TimeSpan) { Start-Sleep -Milliseconds 100 }; $player.Close()`
           ];
-        } catch (error) {
+        } catch (error: unknown) {
           this.currentTrack = null;
           this.emit('error', { track: trackInfo, error });
           throw error;
@@ -259,7 +297,7 @@ export class AudioPlayer extends EventEmitter {
       });
 
       return true;
-    } catch (error) {
+    } catch (error: unknown) {
       this.currentTrack = null;
       throw error;
     } finally {
@@ -267,18 +305,18 @@ export class AudioPlayer extends EventEmitter {
     }
   }
 
-  async cleanupTempFile() {
+  async cleanupTempFile(): Promise<void> {
     if (this.tempFile) {
       try {
         await fs.remove(this.tempFile);
-      } catch (e) {
+      } catch {
         // Ignore cleanup errors
       }
       this.tempFile = null;
     }
   }
 
-  async stop(silent = false) {
+  async stop(silent = false): Promise<void> {
     if (this.isStopping) return;
 
     const track = this.currentTrack;
@@ -294,39 +332,54 @@ export class AudioPlayer extends EventEmitter {
       this.isPaused = false;
 
       try {
-        // Graceful shutdown: SIGTERM first, then SIGKILL
-        await new Promise((resolve) => {
-          let resolved = false;
-          const cleanup = () => {
-            if (!resolved) {
-              resolved = true;
-              resolve();
-            }
-          };
+        // Graceful shutdown with absolute maximum timeout
+        const MAX_STOP_TIMEOUT = 5000; // 5 seconds absolute max
+        let forceKilled = false; // Prevent duplicate SIGKILL
 
-          proc.once('close', cleanup);
-          proc.once('exit', cleanup);
+        const forceKill = () => {
+          if (forceKilled) return;
+          forceKilled = true;
+          try { proc.kill('SIGKILL'); } catch { /* ignore - process may be dead */ }
+        };
 
-          // Try graceful termination first
-          try {
-            proc.kill('SIGTERM');
-          } catch (e) {
-            // Process may already be dead
-            cleanup();
-            return;
-          }
+        await Promise.race([
+          // Main shutdown logic
+          new Promise<void>((resolve) => {
+            let resolved = false;
+            const cleanup = () => {
+              if (!resolved) {
+                resolved = true;
+                resolve();
+              }
+            };
 
-          // Force kill after timeout if still running
-          setTimeout(() => {
+            proc.once('close', cleanup);
+            proc.once('exit', cleanup);
+
+            // Try graceful termination first
             try {
-              proc.kill('SIGKILL');
-            } catch (e) {
-              // Ignore - process may already be dead
+              proc.kill('SIGTERM');
+            } catch {
+              // Process may already be dead
+              cleanup();
+              return;
             }
-            // Final timeout to ensure we don't hang
-            setTimeout(cleanup, 500);
-          }, PROCESS_KILL_TIMEOUT);
-        });
+
+            // Force kill after timeout if still running
+            setTimeout(() => {
+              forceKill();
+              // Final timeout to ensure we don't hang
+              setTimeout(cleanup, 500);
+            }, PROCESS_KILL_TIMEOUT);
+          }),
+          // Absolute timeout fallback
+          new Promise<void>((resolve) => {
+            setTimeout(() => {
+              forceKill();
+              resolve();
+            }, MAX_STOP_TIMEOUT);
+          })
+        ]);
 
         // Clean up temp file
         await this.cleanupTempFile();
@@ -345,7 +398,7 @@ export class AudioPlayer extends EventEmitter {
     }
   }
 
-  pause() {
+  pause(): boolean {
     if (this.currentProcess && this.isPlaying && !this.isPaused && !this.isStopping) {
       if (process.platform !== 'win32') {
         try {
@@ -353,7 +406,7 @@ export class AudioPlayer extends EventEmitter {
           this.isPaused = true;
           this.emit('pause', { track: this.currentTrack });
           return true;
-        } catch (e) {
+        } catch {
           // Process may have exited
           return false;
         }
@@ -369,7 +422,7 @@ export class AudioPlayer extends EventEmitter {
     return false;
   }
 
-  resume() {
+  resume(): boolean {
     if (this.currentProcess && this.isPaused && !this.isStopping) {
       if (process.platform !== 'win32') {
         try {
@@ -377,7 +430,7 @@ export class AudioPlayer extends EventEmitter {
           this.isPaused = false;
           this.emit('resume', { track: this.currentTrack });
           return true;
-        } catch (e) {
+        } catch {
           // Process may have exited
           return false;
         }
@@ -386,7 +439,7 @@ export class AudioPlayer extends EventEmitter {
     return false;
   }
 
-  togglePause() {
+  togglePause(): boolean {
     if (this.isPaused) {
       return this.resume();
     } else {
@@ -394,7 +447,7 @@ export class AudioPlayer extends EventEmitter {
     }
   }
 
-  getStatus() {
+  getStatus(): PlayerStatus {
     return {
       isPlaying: this.isPlaying,
       isPaused: this.isPaused,
@@ -403,7 +456,7 @@ export class AudioPlayer extends EventEmitter {
   }
 
   // Clean up leftover temp files from previous crashes
-  async cleanupTempDir() {
+  async cleanupTempDir(): Promise<void> {
     try {
       const exists = await fs.pathExists(TEMP_DIR);
       if (exists) {
@@ -414,7 +467,7 @@ export class AudioPlayer extends EventEmitter {
           }
         }
       }
-    } catch (e) {
+    } catch {
       // Ignore cleanup errors
     }
   }

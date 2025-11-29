@@ -1,12 +1,36 @@
 import { EventEmitter } from 'events';
+import type { Readable } from 'stream';
 import fs from 'fs-extra';
 import path from 'path';
 import { storageManager, slugify } from './manager.js';
 import { albumRepo } from '../data/repositories/album-repo.js';
 import { METADATA_VERSION } from '../constants.js';
+import type { Album, IKhinsiderScraper, DownloadProgress, DownloadedFiles, AlbumMetadata } from '../types/index.js';
+
+interface DownloadOptions {
+  onProgress?: (progress: DownloadProgress) => void;
+}
+
+interface DownloadStatus {
+  isDownloading: boolean;
+  currentDownload: { album: Album } | null;
+}
+
+interface DownloadResult {
+  success: boolean;
+  path: string;
+  files: DownloadedFiles;
+}
 
 export class AlbumDownloader extends EventEmitter {
-  constructor(scraper) {
+  scraper: IKhinsiderScraper;
+  isDownloading: boolean;
+  currentDownload: { album: Album } | null;
+  aborted: boolean;
+  currentStream: Readable | null;
+  currentAlbumPath: string | null;
+
+  constructor(scraper: IKhinsiderScraper) {
     super();
     this.scraper = scraper;
     this.isDownloading = false;
@@ -16,7 +40,7 @@ export class AlbumDownloader extends EventEmitter {
     this.currentAlbumPath = null;
   }
 
-  async downloadFile(url, destPath, options = {}) {
+  async downloadFile(url: string, destPath: string, options: DownloadOptions = {}): Promise<string> {
     const { onProgress } = options;
 
     // Check if aborted before starting
@@ -37,24 +61,28 @@ export class AlbumDownloader extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      let streamsDestroyed = false;
 
-      const handleError = async (err) => {
+      // Centralized stream cleanup with duplicate call protection
+      const destroyStreams = () => {
+        if (streamsDestroyed) return;
+        streamsDestroyed = true;
+        try { response.data.destroy(); } catch { /* ignore */ }
+        try { writer.destroy(); } catch { /* ignore */ }
+      };
+
+      const handleError = async (err: Error) => {
         if (settled) return;
         settled = true;
         this.currentStream = null;
 
         // Clean up both streams and partial file on error
-        try {
-          response.data.destroy();
-          writer.destroy();
-          await fs.unlink(destPath).catch(() => {});
-        } catch {
-          // Ignore cleanup errors
-        }
+        destroyStreams();
+        await fs.unlink(destPath).catch(() => {});
         reject(err);
       };
 
-      response.data.on('data', (chunk) => {
+      response.data.on('data', (chunk: Buffer) => {
         // Check for abort during download
         if (this.aborted) {
           handleError(new Error('Download aborted')).catch(() => {});
@@ -83,17 +111,17 @@ export class AlbumDownloader extends EventEmitter {
         resolve(destPath);
       });
 
-      writer.on('error', handleError);
-      response.data.on('error', handleError);
+      writer.on('error', (err: Error) => handleError(err).catch(() => {}));
+      response.data.on('error', (err: Error) => handleError(err).catch(() => {}));
     });
   }
 
-  async downloadCover(album, albumPath, albumSlug) {
-    if (!album.cover_url && !album.coverUrl) {
+  async downloadCover(album: Album, albumPath: string, albumSlug: string): Promise<string | null> {
+    if (!album.cover_url) {
       return null;
     }
 
-    const coverUrl = album.cover_url || album.coverUrl;
+    const coverUrl = album.cover_url;
     const coverName = `${albumSlug}-cover.jpg`;
     const coverPath = path.join(albumPath, coverName);
 
@@ -101,13 +129,13 @@ export class AlbumDownloader extends EventEmitter {
       await this.downloadFile(coverUrl, coverPath);
       this.emit('coverDownloaded', { album, path: coverPath });
       return coverName;
-    } catch (error) {
+    } catch (error: unknown) {
       this.emit('coverError', { album, error });
       return null;
     }
   }
 
-  async downloadBulkZips(album, albumPath, albumSlug) {
+  async downloadBulkZips(album: Album, albumPath: string, albumSlug: string): Promise<{ mp3: string | null; flac: string | null }> {
     // Get bulk download URLs for MP3 and FLAC
     const urls = await this.scraper.getBulkDownloadUrls(album.url);
 
@@ -131,7 +159,7 @@ export class AlbumDownloader extends EventEmitter {
         });
         results.mp3 = mp3ZipName;
         this.emit('zipComplete', { album, format: 'mp3', path: mp3ZipPath });
-      } catch (error) {
+      } catch (error: unknown) {
         this.emit('zipError', { album, format: 'mp3', error });
       }
     }
@@ -150,7 +178,7 @@ export class AlbumDownloader extends EventEmitter {
         });
         results.flac = flacZipName;
         this.emit('zipComplete', { album, format: 'flac', path: flacZipPath });
-      } catch (error) {
+      } catch (error: unknown) {
         this.emit('zipError', { album, format: 'flac', error });
       }
     }
@@ -158,7 +186,7 @@ export class AlbumDownloader extends EventEmitter {
     return results;
   }
 
-  async downloadAlbum(album) {
+  async downloadAlbum(album: Album): Promise<DownloadResult> {
     if (this.isDownloading) {
       throw new Error('Already downloading');
     }
@@ -187,14 +215,14 @@ export class AlbumDownloader extends EventEmitter {
 
       // Save metadata
       const metadataName = `${slug}-metadata.json`;
-      const metadata = {
+      const metadata: AlbumMetadata = {
         version: METADATA_VERSION,
         albumSlug: slug,
         title: album.title,
         url: album.url,
         year: year,
-        platform: album.platform,
-        coverUrl: album.cover_url || album.coverUrl,
+        platform: album.platform || undefined,
+        coverUrl: album.cover_url || undefined,
         downloadedAt: new Date().toISOString(),
         files: {
           cover: coverName || null,
@@ -221,7 +249,7 @@ export class AlbumDownloader extends EventEmitter {
         path: albumPath,
         files: metadata.files
       };
-    } catch (error) {
+    } catch (error: unknown) {
       // Clean up partial download on any error
       if (this.currentAlbumPath) {
         try {
@@ -240,7 +268,7 @@ export class AlbumDownloader extends EventEmitter {
     }
   }
 
-  async abort() {
+  async abort(): Promise<void> {
     this.aborted = true;
 
     // Destroy current stream if active
@@ -255,13 +283,13 @@ export class AlbumDownloader extends EventEmitter {
     if (this.currentAlbumPath) {
       try {
         await fs.remove(this.currentAlbumPath);
-      } catch (error) {
+      } catch {
         // Ignore cleanup errors
       }
     }
   }
 
-  getStatus() {
+  getStatus(): DownloadStatus {
     return {
       isDownloading: this.isDownloading,
       currentDownload: this.currentDownload
@@ -269,6 +297,6 @@ export class AlbumDownloader extends EventEmitter {
   }
 }
 
-export function createDownloader(scraper) {
+export function createDownloader(scraper: IKhinsiderScraper): AlbumDownloader {
   return new AlbumDownloader(scraper);
 }

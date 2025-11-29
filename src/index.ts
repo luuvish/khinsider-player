@@ -12,22 +12,32 @@ const suppressPatterns = [
   '\\u001b'
 ];
 
-const shouldSuppress = (chunk) => {
+const shouldSuppress = (chunk: Uint8Array | string): boolean => {
   if (typeof chunk !== 'string') return false;
   return suppressPatterns.some(pattern => chunk.includes(pattern));
 };
 
+type WriteCallback = (err?: Error) => void;
+
 const originalStderrWrite = process.stderr.write.bind(process.stderr);
-process.stderr.write = (chunk, encoding, callback) => {
+process.stderr.write = ((
+  chunk: Uint8Array | string,
+  encodingOrCallback?: BufferEncoding | WriteCallback,
+  callback?: WriteCallback
+): boolean => {
   if (shouldSuppress(chunk)) return true;
-  return originalStderrWrite(chunk, encoding, callback);
-};
+  return originalStderrWrite(chunk, encodingOrCallback as BufferEncoding, callback);
+}) as typeof process.stderr.write;
 
 const originalStdoutWrite = process.stdout.write.bind(process.stdout);
-process.stdout.write = (chunk, encoding, callback) => {
+process.stdout.write = ((
+  chunk: Uint8Array | string,
+  encodingOrCallback?: BufferEncoding | WriteCallback,
+  callback?: WriteCallback
+): boolean => {
   if (shouldSuppress(chunk)) return true;
-  return originalStdoutWrite(chunk, encoding, callback);
-};
+  return originalStdoutWrite(chunk, encodingOrCallback as BufferEncoding, callback);
+}) as typeof process.stdout.write;
 
 import { initializeDatabase, closeDatabase } from './data/database.js';
 import { albumRepo } from './data/repositories/album-repo.js';
@@ -64,44 +74,52 @@ async function main() {
       downloader
     });
 
-    // Handle graceful shutdown
-    const shutdown = async () => {
-      await playbackController.stop();
-      closeDatabase();
-      process.exit(0);
+    // Handle graceful shutdown with timeout
+    const SHUTDOWN_TIMEOUT = 5000; // 5 seconds max for cleanup
+    let isShuttingDown = false;
+
+    const shutdown = async (exitCode = 0) => {
+      if (isShuttingDown) return; // Prevent multiple shutdown attempts
+      isShuttingDown = true;
+
+      // Force exit if cleanup takes too long
+      const forceExitTimer = setTimeout(() => {
+        console.error('Shutdown timeout - forcing exit');
+        process.exit(exitCode);
+      }, SHUTDOWN_TIMEOUT);
+
+      try {
+        await playbackController.stop();
+      } catch (e) {
+        console.error('Error stopping playback:', e);
+      }
+
+      try {
+        closeDatabase();
+      } catch (e) {
+        console.error('Error closing database:', e);
+      }
+
+      clearTimeout(forceExitTimer);
+      process.exit(exitCode);
     };
 
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', () => shutdown(0));
+    process.on('SIGTERM', () => shutdown(0));
     process.on('uncaughtException', async (error) => {
-      // Log error before shutdown for debugging
       console.error('Uncaught Exception:', error);
-      try {
-        await playbackController.stop();
-        closeDatabase();
-      } catch {
-        // Ignore cleanup errors
-      }
-      process.exit(1);
+      await shutdown(1);
     });
     process.on('unhandledRejection', async (reason, promise) => {
-      // Log unhandled promise rejections
       console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-      // Cleanup resources on unhandled rejection
-      try {
-        await playbackController.stop();
-        closeDatabase();
-      } catch {
-        // Ignore cleanup errors
-      }
-      process.exit(1);
+      await shutdown(1);
     });
 
     // Initialize and run app
     await app.initialize();
     app.run();
 
-  } catch (error) {
+  } catch {
     closeDatabase();
     process.exit(1);
   }

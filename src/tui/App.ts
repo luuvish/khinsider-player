@@ -1,28 +1,94 @@
 import blessed from 'blessed';
-import { NavigationPanel } from './panels/NavigationPanel.js';
+import { NavigationPanel, type NavigationSelectData } from './panels/NavigationPanel.js';
 import { NowPlayingPanel } from './panels/NowPlayingPanel.js';
-import { FavoritesPanel } from './panels/FavoritesPanel.js';
+import { FavoritesPanel, type FavoritesSelectData } from './panels/FavoritesPanel.js';
 import { HistoryPanel } from './panels/HistoryPanel.js';
 import { StatusBar } from './panels/StatusBar.js';
 import { TitleBar } from './panels/TitleBar.js';
 import { helpText } from './utils/keyBindings.js';
 import { showLoginForm } from './utils/loginForm.js';
 import { settingsRepo } from '../data/repositories/settings-repo.js';
+import type {
+  IKhinsiderScraper,
+  Album,
+  AlbumInfo,
+  YearInfo,
+  TrackStartEventData,
+  TrackCompletedEventData,
+  AlbumEventData,
+  AlbumLoadedEventData,
+  YearEventData,
+  YearLoadedEventData,
+  ErrorEventData,
+  DownloadEventData,
+  DownloadProgressEventData,
+  DownloadErrorEventData
+} from '../types/index.js';
+import type { PlaybackController } from '../playback/controller.js';
+import type { AlbumRepository } from '../data/repositories/album-repo.js';
+import type { TrackRepository } from '../data/repositories/track-repo.js';
+import type { AlbumDownloader } from '../storage/downloader.js';
+
+// Helper to safely extract error message from any error type
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  return 'Unknown error';
+}
+
+type EventListener = (...args: unknown[]) => void;
+
+interface AppPanels {
+  titleBar: TitleBar;
+  navigation: NavigationPanel;
+  nowPlaying: NowPlayingPanel;
+  favorites: FavoritesPanel;
+  history: HistoryPanel;
+  statusBar: StatusBar;
+}
+
+interface AppOptions {
+  scraper?: IKhinsiderScraper;
+  playbackController?: PlaybackController;
+  albumRepo?: AlbumRepository;
+  trackRepo?: TrackRepository;
+  downloader?: AlbumDownloader;
+}
 
 export class App {
-  constructor(options = {}) {
-    this.scraper = options.scraper;
-    this.playbackController = options.playbackController;
-    this.albumRepo = options.albumRepo;
-    this.trackRepo = options.trackRepo;
-    this.downloader = options.downloader;
+  scraper!: IKhinsiderScraper;
+  playbackController!: PlaybackController;
+  albumRepo!: AlbumRepository;
+  trackRepo!: TrackRepository;
+  downloader!: AlbumDownloader;
+  screen: blessed.Widgets.Screen | null;
+  panels!: AppPanels;
+  focusedPanel: string;
+  isInitialized: boolean;
+  dialogActive: boolean;
+  _activeDialogCleanup: (() => void) | null;
+  _globalKeyHandler: ((ch: string, key: blessed.Widgets.KeyEventData) => void) | null;
+  _pcListeners: Record<string, EventListener> | null;
+  _dlListeners: Record<string, EventListener> | null;
+  _backgroundPromises: Promise<void>[];
+
+  constructor(options: AppOptions = {}) {
+    this.scraper = options.scraper!;
+    this.playbackController = options.playbackController!;
+    this.albumRepo = options.albumRepo!;
+    this.trackRepo = options.trackRepo!;
+    this.downloader = options.downloader!;
 
     this.screen = null;
-    this.panels = {};
+    this.panels = {} as AppPanels;
     this.focusedPanel = 'navigation';
     this.isInitialized = false;
     this.dialogActive = false;
     this._activeDialogCleanup = null; // Track active dialog cleanup function
+    this._globalKeyHandler = null;
+    this._pcListeners = null;
+    this._dlListeners = null;
+    this._backgroundPromises = [];
   }
 
   async initialize() {
@@ -44,14 +110,14 @@ export class App {
         this.panels.statusBar.showSuccess('Logged in as ' + credentials.username);
         this.panels.history.logInfo('Logged in as ' + credentials.username);
         this.updateLoginStatus();
-      } catch (error) {
-        this.panels.statusBar.showError('Auto-login failed: ' + error.message);
+      } catch (error: unknown) {
+        this.panels.statusBar.showError('Auto-login failed: ' + getErrorMessage(error));
         this.panels.history.logError('Auto-login failed');
       }
     }
   }
 
-  updateLoginStatus() {
+  updateLoginStatus(): void {
     const isLoggedIn = this.scraper.isLoggedIn;
     const credentials = settingsRepo.getCredentials();
     const username = credentials?.username || '';
@@ -204,7 +270,7 @@ export class App {
     this.screen.program.on('keypress', this._globalKeyHandler);
   }
 
-  focusPanel(panelName) {
+  focusPanel(panelName: string): void {
     // Blur current panel
     if (this.focusedPanel === 'navigation') {
       this.panels.navigation.blur();
@@ -250,12 +316,13 @@ export class App {
         this.panels.nowPlaying.setLoading();
         this.panels.history.logInfo('Loading track...');
       },
-      trackStart: (data) => {
+      trackStart: (data: unknown) => {
+        const d = data as TrackStartEventData;
         this.panels.nowPlaying.setPlaying(
-          data.track,
-          data.album,
-          data.trackIndex,
-          data.totalTracks
+          d.track,
+          d.album,
+          d.trackIndex,
+          d.totalTracks
         );
 
         const status = pc.getStatus();
@@ -267,11 +334,12 @@ export class App {
           });
         }
 
-        this.panels.history.logPlay(`${data.track.name}`);
+        this.panels.history.logPlay(`${d.track.name}`);
       },
-      trackCompleted: (data) => {
-        this.panels.navigation.markTrackCompleted(data.track.id, data.album?.id);
-        this.panels.history.logInfo(`Completed: ${data.track.name}`);
+      trackCompleted: (data: unknown) => {
+        const d = data as TrackCompletedEventData;
+        this.panels.navigation.markTrackCompleted(d.track.id, d.album?.id);
+        this.panels.history.logInfo(`Completed: ${d.track.name}`);
       },
       paused: () => {
         this.panels.nowPlaying.setPaused();
@@ -285,34 +353,42 @@ export class App {
         this.panels.nowPlaying.setIdle();
         this.panels.history.logStop('Stopped');
       },
-      error: (data) => {
-        this.panels.statusBar.showError(data.message || 'Playback error');
-        this.panels.nowPlaying.setError();
-        this.panels.history.logError(data.message || 'Playback error');
+      error: (data: unknown) => {
+        const d = data as ErrorEventData;
+        this.panels.statusBar.showError(d.message || 'Playback error');
+        this.panels.nowPlaying.setError(d.message || 'Playback error');
+        this.panels.history.logError(d.message || 'Playback error');
       },
-      albumChange: (data) => {
-        this.panels.nowPlaying.setAlbum(data.album);
-        this.panels.statusBar.showInfo(`Now playing album: ${data.album.title}`);
-        this.panels.history.logInfo(`Album: ${data.album.title}`);
+      albumChange: (data: unknown) => {
+        const d = data as AlbumEventData;
+        this.panels.nowPlaying.setAlbum(d.album);
+        this.panels.statusBar.showInfo(`Now playing album: ${d.album.title}`);
+        this.panels.history.logInfo(`Album: ${d.album.title}`);
       },
-      albumComplete: (data) => {
-        this.panels.statusBar.showInfo(`Album complete: ${data.album.title}`);
+      albumComplete: (data: unknown) => {
+        const d = data as AlbumEventData;
+        this.panels.statusBar.showInfo(`Album complete: ${d.album.title}`);
       },
-      yearComplete: (data) => {
-        this.panels.statusBar.showSuccess(`Year ${data.year} complete!`);
+      yearComplete: (data: unknown) => {
+        const d = data as YearEventData;
+        this.panels.statusBar.showSuccess(`Year ${d.year} complete!`);
         this.panels.nowPlaying.setIdle();
       },
-      loadingYear: (data) => {
-        this.panels.statusBar.showInfo(`Loading albums for ${data.year}...`);
+      loadingYear: (data: unknown) => {
+        const d = data as YearEventData;
+        this.panels.statusBar.showInfo(`Loading albums for ${d.year}...`);
       },
-      yearLoaded: (data) => {
-        this.panels.statusBar.showInfo(`Loaded ${data.albumCount} albums for ${data.year}`);
+      yearLoaded: (data: unknown) => {
+        const d = data as YearLoadedEventData;
+        this.panels.statusBar.showInfo(`Loaded ${d.albumCount} albums for ${d.year}`);
       },
-      loadingAlbum: (data) => {
-        this.panels.statusBar.showInfo(`Loading tracks for ${data.album.title}...`);
+      loadingAlbum: (data: unknown) => {
+        const d = data as AlbumEventData;
+        this.panels.statusBar.showInfo(`Loading tracks for ${d.album.title}...`);
       },
-      albumLoaded: (data) => {
-        this.panels.statusBar.showInfo(`Loaded ${data.trackCount} tracks`);
+      albumLoaded: (data: unknown) => {
+        const d = data as AlbumLoadedEventData;
+        this.panels.statusBar.showInfo(`Loaded ${d.trackCount} tracks`);
       }
     };
 
@@ -324,27 +400,32 @@ export class App {
     // Downloader events
     if (this.downloader) {
       this._dlListeners = {
-        start: (data) => {
-          this.panels.statusBar.showInfo(`Downloading: ${data.album.title}`);
-          this.panels.history.logDownload(`Started: ${data.album.title}`);
+        start: (data: unknown) => {
+          const d = data as DownloadEventData;
+          this.panels.statusBar.showInfo(`Downloading: ${d.album.title}`);
+          this.panels.history.logDownload(`Started: ${d.album.title}`);
         },
-        zipProgress: (data) => {
-          const formatStr = data.format?.toUpperCase() || '';
-          if (data.percent !== undefined) {
-            this.panels.statusBar.showInfo(`Downloading ${formatStr}: ${data.percent}%`);
+        zipProgress: (data: unknown) => {
+          const d = data as DownloadProgressEventData;
+          const formatStr = d.format?.toUpperCase() || '';
+          if (d.percent !== undefined) {
+            this.panels.statusBar.showInfo(`Downloading ${formatStr}: ${d.percent}%`);
           }
         },
-        zipComplete: (data) => {
-          const formatStr = data.format?.toUpperCase() || '';
+        zipComplete: (data: unknown) => {
+          const d = data as DownloadProgressEventData;
+          const formatStr = d.format?.toUpperCase() || '';
           this.panels.history.logDownload(`Downloaded: ${formatStr}.zip`);
         },
-        complete: (data) => {
-          this.panels.statusBar.showSuccess(`Download complete: ${data.album.title}`);
+        complete: (data: unknown) => {
+          const d = data as DownloadEventData;
+          this.panels.statusBar.showSuccess(`Download complete: ${d.album.title}`);
           this.panels.favorites.refresh();
-          this.panels.history.logDownload(`Complete: ${data.album.title}`);
+          this.panels.history.logDownload(`Complete: ${d.album.title}`);
         },
-        error: (data) => {
-          const errorMsg = data?.error?.message || 'Unknown error';
+        error: (data: unknown) => {
+          const d = data as DownloadErrorEventData;
+          const errorMsg = d?.error?.message || 'Unknown error';
           this.panels.statusBar.showError(`Download failed: ${errorMsg}`);
           this.panels.history.logError(`Download failed: ${errorMsg}`);
         }
@@ -361,7 +442,7 @@ export class App {
 
     try {
       // Get years from database for album counts
-      const dbYears = this.albumRepo.getYears();
+      const dbYears = (this.albumRepo.getYears() || []) as YearInfo[];
       const dbYearMap = new Map(dbYears.map(y => [y.year, y.album_count]));
 
       // Fetch actual year list from web
@@ -394,13 +475,13 @@ export class App {
 
       // Restore last position
       await this.panels.navigation.restoreLastPosition();
-    } catch (error) {
+    } catch {
       this.panels.statusBar.showError('Failed to load years');
       this.panels.history.logError('Failed to load years');
     }
   }
 
-  async handleYearSelect(year) {
+  async handleYearSelect(year: string): Promise<void> {
     this.panels.statusBar.showInfo(`Loading albums for ${year}...`);
 
     try {
@@ -426,12 +507,12 @@ export class App {
       this.panels.navigation.setAlbumsForYear(year, albums);
       this.panels.navigation.updateYearAlbumCount(year, albums.length);
       this.panels.statusBar.reset();
-    } catch (error) {
+    } catch {
       this.panels.statusBar.showError(`Failed to load albums for ${year}`);
     }
   }
 
-  async handleAlbumSelect(album) {
+  async handleAlbumSelect(album: Album): Promise<void> {
     this.panels.nowPlaying.setAlbum(album);
     this.panels.statusBar.showInfo(`Loading tracks for ${album.title}...`);
 
@@ -466,53 +547,70 @@ export class App {
       this.panels.navigation.setTracksForAlbum(album.id, tracks);
 
       // Fetch album info (images, metadata) in background
-      this.scraper.getAlbumInfo(album.url).then(info => {
-        // Null check in case panel is destroyed before async completes
-        if (this.panels.nowPlaying) {
-          this.panels.nowPlaying.setAlbumInfo(info);
+      const albumInfoPromise = this.scraper.getAlbumInfo(album.url).then((info: AlbumInfo) => {
+        // Check if app is still initialized before updating UI
+        if (this.isInitialized && this.panels?.nowPlaying) {
+          try {
+            this.panels.nowPlaying.setAlbumInfo(info);
+          } catch {
+            // Ignore UI update errors - panel may be in bad state
+          }
         }
-      }).catch(error => {
-        if (this.panels.history) {
-          this.panels.history.logError(`Failed to load album info: ${error?.message || 'Unknown error'}`);
+      }).catch((error: unknown) => {
+        // Safely log error - don't let logging failure cause unhandled rejection
+        if (this.isInitialized && this.panels?.history) {
+          try {
+            this.panels.history.logError(`Failed to load album info: ${getErrorMessage(error)}`);
+          } catch {
+            // Ignore logging errors - panel may be destroyed
+          }
         }
       });
+      this._backgroundPromises.push(albumInfoPromise);
 
       this.panels.statusBar.reset();
-    } catch (error) {
+    } catch {
       this.panels.statusBar.showError(`Failed to load tracks`);
     }
   }
 
-  async handleNavigationSelect(data) {
+  async handleNavigationSelect(data: NavigationSelectData): Promise<void> {
     if (data.type === 'track') {
       // Play album starting from selected track
       await this.playbackController.playAlbum(data.album, data.trackIndex);
     }
   }
 
-  async handleFavoriteSelect(data) {
-    if (data.type === 'track') {
+  async handleFavoriteSelect(data: FavoritesSelectData): Promise<void> {
+    if (data.type === 'track' && data.track) {
       // Play album starting from selected track
       this.panels.statusBar.showInfo(`Playing: ${data.track.name}`);
       await this.playbackController.playAlbum(data.album, data.trackIndex);
     }
   }
 
-  async handleFavoriteAlbumSelect(album) {
+  async handleFavoriteAlbumSelect(album: Album) {
     // Update Now Playing panel with album info
     this.panels.nowPlaying.setAlbum(album);
 
-    // Fetch album info in background
-    this.scraper.getAlbumInfo(album.url).then(info => {
-      // Null check in case panel is destroyed before async completes
-      if (this.panels.nowPlaying) {
+    // Fetch album info in background with proper tracking
+    const albumInfoPromise = this.scraper.getAlbumInfo(album.url).then((info: AlbumInfo) => {
+      // Check isInitialized to prevent updates after quit
+      if (this.isInitialized && this.panels?.nowPlaying) {
         this.panels.nowPlaying.setAlbumInfo(info);
       }
-    }).catch(error => {
-      if (this.panels.history) {
-        this.panels.history.logError(`Failed to load album info: ${error?.message || 'Unknown error'}`);
+    }).catch((error: unknown) => {
+      if (this.isInitialized && this.panels?.history) {
+        try {
+          this.panels.history.logError(`Failed to load album info: ${getErrorMessage(error)}`);
+        } catch {
+          // Ignore logging errors during shutdown
+        }
       }
     });
+
+    // Track promise for cleanup during quit
+    this._backgroundPromises.push(albumInfoPromise);
   }
 
   togglePause() {
@@ -583,7 +681,7 @@ export class App {
     }
   }
 
-  async refreshYear(year) {
+  async refreshYear(year: string): Promise<void> {
     this.panels.statusBar.showInfo(`Fetching all albums for ${year} (may take a moment)...`);
 
     try {
@@ -600,12 +698,12 @@ export class App {
       this.panels.navigation.setAlbumsForYear(year, albums);
       this.panels.navigation.updateYearAlbumCount(year, albums.length);
       this.panels.statusBar.showSuccess(`Refreshed ${albums.length} albums for ${year}`);
-    } catch (error) {
+    } catch {
       this.panels.statusBar.showError(`Failed to refresh albums for ${year}`);
     }
   }
 
-  async refreshAlbum(album) {
+  async refreshAlbum(album: Album): Promise<void> {
     this.panels.statusBar.showInfo(`Refreshing tracks for ${album.title}...`);
 
     try {
@@ -644,7 +742,7 @@ export class App {
       this.panels.navigation.setTracksForAlbum(album.id, tracks);
       this.panels.favorites.refresh();
       this.panels.statusBar.showSuccess(`Refreshed ${tracks.length} tracks`);
-    } catch (error) {
+    } catch {
       this.panels.statusBar.showError(`Failed to refresh tracks`);
     }
   }
@@ -681,7 +779,7 @@ export class App {
     }
 
     // Get fresh album data from database to check current favorite status
-    const freshAlbum = this.albumRepo.getById(album.id);
+    const freshAlbum = this.albumRepo.getById(album.id) as Album | undefined;
     const isFavorite = freshAlbum?.is_favorite === 1;
     const action = isFavorite ? 'Remove from' : 'Add to';
     const message = `${action} favorites?\n\n{cyan-fg}${album.title}{/cyan-fg}`;
@@ -747,7 +845,7 @@ export class App {
     this.showDownloadMenu(album);
   }
 
-  showDownloadMenu(album) {
+  showDownloadMenu(album: Album): void {
     const isDownloaded = album.is_downloaded;
     const credentials = settingsRepo.getCredentials();
     const downloadedText = isDownloaded ? ' (Re-download)' : '';
@@ -775,9 +873,9 @@ export class App {
 
           // Now proceed with download (await to ensure errors are handled)
           await this.startDownload(album);
-        } catch (error) {
-          this.panels.statusBar.showError('Login failed: ' + error.message);
-          this.panels.history.logError('Login failed: ' + error.message);
+        } catch (error: unknown) {
+          this.panels.statusBar.showError('Login failed: ' + getErrorMessage(error));
+          this.panels.history.logError('Login failed: ' + getErrorMessage(error));
         }
       },
       onCancel: () => {
@@ -786,16 +884,29 @@ export class App {
     });
   }
 
-  async startDownload(album) {
+  async startDownload(album: Album): Promise<void> {
+    if (!this.downloader) {
+      this.panels.statusBar.showError('Downloader not available');
+      return;
+    }
     this.panels.statusBar.showInfo(`Starting download: ${album.title}`);
     try {
       await this.downloader.downloadAlbum(album);
-    } catch (error) {
-      this.panels.statusBar.showError(`Download failed: ${error.message}`);
+    } catch (error: unknown) {
+      this.panels.statusBar.showError(`Download failed: ${getErrorMessage(error)}`);
     }
   }
 
-  showConfirm(message, callback) {
+  showConfirm(message: string, callback: (confirmed: boolean) => void): void {
+    // Clean up any existing dialog first to prevent listener accumulation
+    if (this._activeDialogCleanup) {
+      try {
+        this._activeDialogCleanup();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+
     this.dialogActive = true;
 
     const confirmBox = blessed.box({
@@ -823,7 +934,14 @@ export class App {
       this.dialogActive = false;
       this._activeDialogCleanup = null;
       this.screen.removeListener('keypress', handleKey);
-      confirmBox.destroy();
+      // Safely destroy confirmBox (may be null if blessed.box() failed)
+      if (confirmBox) {
+        try {
+          confirmBox.destroy();
+        } catch {
+          // Ignore destroy errors
+        }
+      }
       this.screen.render();
     };
 
@@ -834,18 +952,16 @@ export class App {
       if (handled) return;
       if (key.name === 'y') {
         cleanup();
-        try {
-          callback(true);
-        } catch (error) {
-          this.panels.statusBar?.showError(`Error: ${error.message}`);
-        }
+        // Handle both sync and async callbacks
+        Promise.resolve().then(() => callback(true)).catch((error) => {
+          this.panels.statusBar?.showError(`Error: ${getErrorMessage(error)}`);
+        });
       } else if (key.name === 'n' || key.name === 'escape') {
         cleanup();
-        try {
-          callback(false);
-        } catch (error) {
-          this.panels.statusBar?.showError(`Error: ${error.message}`);
-        }
+        // Handle both sync and async callbacks
+        Promise.resolve().then(() => callback(false)).catch((error) => {
+          this.panels.statusBar?.showError(`Error: ${getErrorMessage(error)}`);
+        });
       }
     };
 
@@ -853,6 +969,15 @@ export class App {
   }
 
   showLoginDialog() {
+    // Clean up any existing dialog first to prevent listener accumulation
+    if (this._activeDialogCleanup) {
+      try {
+        this._activeDialogCleanup();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+
     const isLoggedIn = this.scraper.isLoggedIn;
     const credentials = settingsRepo.getCredentials();
 
@@ -904,7 +1029,7 @@ export class App {
         if (ch === 'L' || ch === 'l') {
           cleanup();
           this.handleLogout().catch(error => {
-            this.panels.statusBar?.showError(`Logout error: ${error.message}`);
+            this.panels.statusBar?.showError(`Logout error: ${getErrorMessage(error)}`);
           });
         } else if (key.name === 'escape') {
           cleanup();
@@ -933,9 +1058,9 @@ export class App {
             this.panels.statusBar.showSuccess('Logged in as ' + username);
             this.panels.history.logInfo('Logged in as ' + username);
             this.updateLoginStatus();
-          } catch (error) {
-            this.panels.statusBar.showError('Login failed: ' + error.message);
-            this.panels.history.logError('Login failed: ' + error.message);
+          } catch (error: unknown) {
+            this.panels.statusBar.showError('Login failed: ' + getErrorMessage(error));
+            this.panels.history.logError('Login failed: ' + getErrorMessage(error));
           }
         },
         onCancel: () => {
@@ -945,7 +1070,7 @@ export class App {
     }
   }
 
-  async handleLogout() {
+  async handleLogout(): Promise<void> {
     await this.scraper.logout();
     settingsRepo.clearCredentials();
     settingsRepo.clearSession();
@@ -955,6 +1080,15 @@ export class App {
   }
 
   showHelp() {
+    // Clean up any existing dialog first to prevent listener accumulation
+    if (this._activeDialogCleanup) {
+      try {
+        this._activeDialogCleanup();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+
     this.dialogActive = true;
 
     const helpBox = blessed.box({
@@ -976,13 +1110,14 @@ export class App {
 
     let closed = false;
 
+    const helpKeys = ['escape', 'q', '?', 'enter'];
     const closeHelp = () => {
       if (closed) return;
       closed = true;
       this.dialogActive = false;
       this._activeDialogCleanup = null;
       // Remove the onceKey listener to prevent memory leak
-      this.screen.unkey(['escape', 'q', '?', 'enter'], closeHelp);
+      this.screen.unkey(helpKeys, closeHelp);
       helpBox.destroy();
       this.screen.render();
     };
@@ -990,21 +1125,25 @@ export class App {
     // Track cleanup for external shutdown
     this._activeDialogCleanup = closeHelp;
 
-    this.screen.onceKey(['escape', 'q', '?', 'enter'], closeHelp);
+    this.screen.onceKey(helpKeys, closeHelp);
   }
 
-  async playYear(year) {
+  async playYear(year: string): Promise<void> {
     this.panels.statusBar.showInfo(`Starting playback for year ${year}...`);
     await this.playbackController.playYear(year);
   }
 
   async quit() {
+    // Mark as not initialized first to prevent background promises from updating UI
+    this.isInitialized = false;
+
     // Clean up any active dialog
     if (this._activeDialogCleanup) {
       try {
         this._activeDialogCleanup();
-      } catch {
-        // Ignore cleanup errors
+      } catch (e) {
+        // Log but don't fail on cleanup errors
+        console.error('Dialog cleanup error:', e);
       }
       this._activeDialogCleanup = null;
     }
@@ -1018,6 +1157,19 @@ export class App {
     // Save current position before quitting
     if (this.panels?.navigation) {
       this.panels.navigation.saveCurrentPosition();
+    }
+
+    // Wait for background promises to settle (with timeout)
+    // Capture and clear immediately to prevent new promises from being added during wait
+    const pendingPromises = this._backgroundPromises;
+    this._backgroundPromises = []; // Clear immediately to prevent race condition
+
+    if (pendingPromises.length > 0) {
+      const BACKGROUND_TIMEOUT = 2000; // 2 seconds max
+      await Promise.race([
+        Promise.allSettled(pendingPromises),
+        new Promise(resolve => setTimeout(resolve, BACKGROUND_TIMEOUT))
+      ]);
     }
 
     // Stop playback first (before removing listeners)

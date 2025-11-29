@@ -1,8 +1,47 @@
 import blessed from 'blessed';
 import { trackRepo } from '../../data/repositories/track-repo.js';
+import type { Album, Track } from '../../types/index.js';
+import type { AlbumRepository } from '../../data/repositories/album-repo.js';
+
+export interface FavoritesSelectData {
+  type: string;
+  track?: Track;
+  album?: Album | null;
+  trackIndex?: number;
+}
+
+interface FavoritesPanelOptions {
+  onSelect?: (data: FavoritesSelectData) => void;
+  onAlbumSelect?: (album: Album) => void | Promise<void>;
+  albumRepo?: AlbumRepository;
+}
+
+interface ListItem {
+  type: string;
+  year?: string;
+  album?: Album;
+  track?: Track;
+  trackIndex?: number;
+  text: string;
+}
 
 export class FavoritesPanel {
-  constructor(screen, options = {}) {
+  screen: blessed.Widgets.Screen;
+  onSelect: (data: FavoritesSelectData) => void;
+  onAlbumSelect: (album: Album) => void | Promise<void>;
+  albumRepo: AlbumRepository | undefined;
+  favorites: Album[];
+  tracks: Record<number, Track[]>;
+  expandedAlbums: Set<number>;
+  expandedYears: Set<string>;
+  selectedAlbum: Album | null;
+  cachedItems: ListItem[];
+  albumsByYear: Record<string, Album[]>;
+  sortedYears: string[];
+  box: blessed.Widgets.BoxElement;
+  list: blessed.Widgets.ListElement;
+
+  constructor(screen: blessed.Widgets.Screen, options: FavoritesPanelOptions = {}) {
     this.screen = screen;
     this.onSelect = options.onSelect || (() => {});
     this.onAlbumSelect = options.onAlbumSelect || (() => {});
@@ -20,10 +59,14 @@ export class FavoritesPanel {
     this.albumsByYear = {};  // year -> albums[]
     this.sortedYears = [];   // years sorted descending
 
+    // Initialize UI elements (assigned in createPanel)
+    this.box = null!;
+    this.list = null!;
+
     this.createPanel();
   }
 
-  createPanel() {
+  createPanel(): void {
     this.box = blessed.box({
       parent: this.screen,
       label: ' Favorites ',
@@ -66,7 +109,7 @@ export class FavoritesPanel {
     this.setupEvents();
   }
 
-  setupEvents() {
+  setupEvents(): void {
     // Navigation
     this.list.key(['j', 'down'], () => this.moveDown());
     this.list.key(['k', 'up'], () => this.moveUp());
@@ -84,7 +127,7 @@ export class FavoritesPanel {
   // Navigation
   // ─────────────────────────────────────────────────────────────
 
-  selectAndScroll(index) {
+  selectAndScroll(index: number): void {
     if (index < 0 || index >= this.cachedItems.length) return;
     this.list.selected = index;
     this.adjustScrollMargin(index);
@@ -92,9 +135,10 @@ export class FavoritesPanel {
     this.screen.render();
   }
 
-  adjustScrollMargin(index) {
+  adjustScrollMargin(index: number): void {
     const margin = 2;
-    const visibleHeight = Math.max(1, this.list.height - 2);
+    const listHeight = typeof this.list.height === 'number' ? this.list.height : parseInt(String(this.list.height), 10) || 10;
+    const visibleHeight = Math.max(1, listHeight - 2);
     const scrollTop = this.list.childBase || 0;
     const scrollBottom = scrollTop + visibleHeight - 1;
 
@@ -105,33 +149,35 @@ export class FavoritesPanel {
     }
   }
 
-  moveDown() {
+  moveDown(): void {
     const newIndex = Math.min(this.list.selected + 1, this.cachedItems.length - 1);
     this.selectAndScroll(newIndex);
   }
 
-  moveUp() {
+  moveUp(): void {
     const newIndex = Math.max(this.list.selected - 1, 0);
     this.selectAndScroll(newIndex);
   }
 
-  goToTop() {
+  goToTop(): void {
     this.selectAndScroll(0);
   }
 
-  goToBottom() {
+  goToBottom(): void {
     this.selectAndScroll(this.cachedItems.length - 1);
   }
 
-  pageDown() {
-    const visibleHeight = Math.max(1, this.list.height - 2);
+  pageDown(): void {
+    const listHeight = typeof this.list.height === 'number' ? this.list.height : parseInt(String(this.list.height), 10) || 10;
+    const visibleHeight = Math.max(1, listHeight - 2);
     const halfPage = Math.floor(visibleHeight / 2);
     const newIndex = Math.min(this.list.selected + halfPage, this.cachedItems.length - 1);
     this.selectAndScroll(newIndex);
   }
 
-  pageUp() {
-    const visibleHeight = Math.max(1, this.list.height - 2);
+  pageUp(): void {
+    const listHeight = typeof this.list.height === 'number' ? this.list.height : parseInt(String(this.list.height), 10) || 10;
+    const visibleHeight = Math.max(1, listHeight - 2);
     const halfPage = Math.floor(visibleHeight / 2);
     const newIndex = Math.max(this.list.selected - halfPage, 0);
     this.selectAndScroll(newIndex);
@@ -141,27 +187,29 @@ export class FavoritesPanel {
   // Expand / Collapse
   // ─────────────────────────────────────────────────────────────
 
-  expandOrSelect() {
+  expandOrSelect(): void {
     const index = this.list.selected;
     const item = this.cachedItems[index];
     if (!item) return;
 
     if (item.type === 'track') {
-      // Play track
-      this.onSelect({
+      // Play track - handle async callback with error catching
+      Promise.resolve(this.onSelect({
         type: 'track',
         track: item.track,
         album: this.selectedAlbum,
         trackIndex: item.trackIndex
+      })).catch((err: unknown) => {
+        console.error('onSelect error:', err);
       });
-    } else if (item.type === 'year') {
+    } else if (item.type === 'year' && item.year) {
       this.toggleYear(item.year);
-    } else if (item.type === 'album') {
+    } else if (item.type === 'album' && item.album) {
       this.toggleAlbum(item.album);
     }
   }
 
-  collapse() {
+  collapse(): void {
     const index = this.list.selected;
     const item = this.cachedItems[index];
     if (!item) return;
@@ -171,13 +219,14 @@ export class FavoritesPanel {
       for (let i = index - 1; i >= 0; i--) {
         if (this.cachedItems[i].type === 'album') {
           const album = this.cachedItems[i].album;
+          if (!album) continue;
           this.expandedAlbums.delete(album.id);
           this.selectedAlbum = null;
           this.rebuildAndSelect(i);
           return;
         }
       }
-    } else if (item.type === 'album') {
+    } else if (item.type === 'album' && item.album) {
       // If album is expanded, collapse it
       if (this.expandedAlbums.has(item.album.id)) {
         this.expandedAlbums.delete(item.album.id);
@@ -189,12 +238,13 @@ export class FavoritesPanel {
       for (let i = index - 1; i >= 0; i--) {
         if (this.cachedItems[i].type === 'year') {
           const year = this.cachedItems[i].year;
+          if (!year) continue;
           this.expandedYears.delete(year);
           this.rebuildAndSelect(i);
           return;
         }
       }
-    } else if (item.type === 'year') {
+    } else if (item.type === 'year' && item.year) {
       // Collapse year if expanded
       if (this.expandedYears.has(item.year)) {
         this.expandedYears.delete(item.year);
@@ -203,7 +253,7 @@ export class FavoritesPanel {
     }
   }
 
-  toggleYear(year) {
+  toggleYear(year: string): void {
     const currentIndex = this.list.selected;
     if (this.expandedYears.has(year)) {
       this.expandedYears.delete(year);
@@ -213,7 +263,7 @@ export class FavoritesPanel {
     this.rebuildAndSelect(currentIndex);
   }
 
-  toggleAlbum(album) {
+  toggleAlbum(album: Album): void {
     const currentIndex = this.list.selected;
     if (this.expandedAlbums.has(album.id)) {
       this.expandedAlbums.delete(album.id);
@@ -226,7 +276,10 @@ export class FavoritesPanel {
         const tracks = trackRepo.getByAlbumId(album.id);
         this.tracks[album.id] = tracks;
       }
-      this.onAlbumSelect(album);
+      // Handle async callback with error catching
+      Promise.resolve(this.onAlbumSelect(album)).catch((err: unknown) => {
+        console.error('onAlbumSelect error:', err);
+      });
     }
     this.rebuildAndSelect(currentIndex);
   }
@@ -235,7 +288,7 @@ export class FavoritesPanel {
   // Data
   // ─────────────────────────────────────────────────────────────
 
-  refresh() {
+  refresh(): void {
     if (!this.albumRepo) return;
 
     this.favorites = this.albumRepo.getFavorites();
@@ -261,7 +314,7 @@ export class FavoritesPanel {
     this.render();
   }
 
-  buildItems() {
+  buildItems(): void {
     this.cachedItems = [];
 
     for (const year of this.sortedYears) {
@@ -304,7 +357,7 @@ export class FavoritesPanel {
     }
   }
 
-  rebuildAndSelect(targetIndex) {
+  rebuildAndSelect(targetIndex: number): void {
     this.buildItems();
     this.list.setItems(this.cachedItems.map(i => i.text));
 
@@ -317,7 +370,7 @@ export class FavoritesPanel {
     this.screen.render();
   }
 
-  render() {
+  render(): void {
     this.list.setItems(this.cachedItems.map(i => i.text));
     if (this.cachedItems.length > 0 && this.list.selected >= this.cachedItems.length) {
       this.list.selected = this.cachedItems.length - 1;
@@ -326,12 +379,12 @@ export class FavoritesPanel {
     this.screen.render();
   }
 
-  updateLabel() {
+  updateLabel(): void {
     const count = this.favorites.length;
     this.box.setLabel(` Favorites (${count}) `);
   }
 
-  getSelectedItem() {
+  getSelectedItem(): ListItem | null {
     const index = this.list.selected;
     return this.cachedItems[index] || null;
   }
@@ -340,18 +393,18 @@ export class FavoritesPanel {
   // Public API
   // ─────────────────────────────────────────────────────────────
 
-  focus() {
+  focus(): void {
     this.list.focus();
     this.box.style.border.fg = 'white';
     this.screen.render();
   }
 
-  blur() {
+  blur(): void {
     this.box.style.border.fg = 'yellow';
     this.screen.render();
   }
 
-  getBox() {
+  getBox(): blessed.Widgets.BoxElement {
     return this.box;
   }
 }

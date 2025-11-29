@@ -1,9 +1,7 @@
 /**
  * 텍스트를 URL-safe slug로 변환
- * @param {string} text - 변환할 텍스트
- * @returns {string} slug
  */
-export function slugify(text) {
+export function slugify(text: string): string {
   if (!text || typeof text !== 'string') {
     return '';
   }
@@ -18,10 +16,8 @@ export function slugify(text) {
 
 /**
  * 파일명에서 위험한 문자 제거
- * @param {string} name - 파일명
- * @returns {string} 안전한 파일명
  */
-export function sanitizeFilename(name) {
+export function sanitizeFilename(name: string): string {
   if (!name || typeof name !== 'string') {
     return '';
   }

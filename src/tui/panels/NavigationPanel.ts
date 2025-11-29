@@ -2,9 +2,62 @@ import blessed from 'blessed';
 import { albumRepo } from '../../data/repositories/album-repo.js';
 import { trackRepo } from '../../data/repositories/track-repo.js';
 import { playbackRepo } from '../../data/repositories/playback-repo.js';
+import type { Album, Track } from '../../types/index.js';
+
+export interface NavigationSelectData {
+  type: string;
+  year?: string;
+  album?: Album;
+  track?: Track;
+  trackIndex?: number;
+}
+
+interface NavigationOptions {
+  onSelect?: (data: NavigationSelectData) => void;
+  onYearSelect?: (year: string) => void;
+  onAlbumSelect?: (album: Album) => void;
+}
+
+interface ListItem {
+  type: string;
+  year?: string;
+  album?: Album;
+  track?: Track;
+  trackIndex?: number;
+  text: string;
+}
+
+interface YearDisplayItem {
+  year: string;
+  album_count?: number;
+}
 
 export class NavigationPanel {
-  constructor(screen, options = {}) {
+  screen: blessed.Widgets.Screen;
+  onSelect: (data: NavigationSelectData) => void;
+  onYearSelect: (year: string) => void | Promise<void>;
+  onAlbumSelect: (album: Album) => void | Promise<void>;
+  years: YearDisplayItem[];
+  albums: Record<string, Album[]>;
+  tracks: Record<number, Track[]>;
+  expandedYears: Set<string>;
+  expandedAlbums: Set<number>;
+  selectedYear: string | null;
+  selectedAlbum: Album | null;
+  lastSelectedAlbumInYear: Map<string, number>;
+  lastSelectedTrackInAlbum: Map<number, number>;
+  searchQuery: string;
+  searchMatches: number[];
+  searchMatchIndex: number;
+  cachedItems: ListItem[];
+  playedAlbums: Set<number>;
+  playedTracks: Set<number>;
+  isRestoring: boolean;
+  box: blessed.Widgets.BoxElement;
+  list: blessed.Widgets.ListElement;
+  searchBox: blessed.Widgets.TextboxElement | null;
+
+  constructor(screen: blessed.Widgets.Screen, options: NavigationOptions = {}) {
     this.screen = screen;
     this.onSelect = options.onSelect || (() => {});
     this.onYearSelect = options.onYearSelect || (() => {});
@@ -38,10 +91,15 @@ export class NavigationPanel {
     // Restore in progress flag
     this.isRestoring = false;
 
+    // Initialize UI elements (assigned in createPanel)
+    this.box = null!;
+    this.list = null!;
+    this.searchBox = null;
+
     this.createPanel();
   }
 
-  createPanel() {
+  createPanel(): void {
     this.box = blessed.box({
       parent: this.screen,
       label: ' Navigation ',
@@ -84,7 +142,7 @@ export class NavigationPanel {
     this.setupEvents();
   }
 
-  setupEvents() {
+  setupEvents(): void {
     // All navigation is handled manually since blessed's keys/vi are disabled
 
     // Navigation: up/down
@@ -118,7 +176,7 @@ export class NavigationPanel {
   // Navigation - manual control
   // ─────────────────────────────────────────────────────────────
 
-  selectAndScroll(index) {
+  selectAndScroll(index: number): void {
     if (index < 0 || index >= this.cachedItems.length) return;
     this.list.selected = index;
     this.adjustScrollMargin(index);
@@ -126,33 +184,35 @@ export class NavigationPanel {
     this.screen.render();
   }
 
-  moveDown() {
+  moveDown(): void {
     const newIndex = Math.min(this.list.selected + 1, this.cachedItems.length - 1);
     this.selectAndScroll(newIndex);
   }
 
-  moveUp() {
+  moveUp(): void {
     const newIndex = Math.max(this.list.selected - 1, 0);
     this.selectAndScroll(newIndex);
   }
 
-  goToTop() {
+  goToTop(): void {
     this.selectAndScroll(0);
   }
 
-  goToBottom() {
+  goToBottom(): void {
     this.selectAndScroll(this.cachedItems.length - 1);
   }
 
-  pageDown() {
-    const visibleHeight = Math.max(1, this.list.height - 2);
+  pageDown(): void {
+    const listHeight = typeof this.list.height === 'number' ? this.list.height : parseInt(String(this.list.height), 10) || 10;
+    const visibleHeight = Math.max(1, listHeight - 2);
     const halfPage = Math.floor(visibleHeight / 2);
     const newIndex = Math.min(this.list.selected + halfPage, this.cachedItems.length - 1);
     this.selectAndScroll(newIndex);
   }
 
-  pageUp() {
-    const visibleHeight = Math.max(1, this.list.height - 2);
+  pageUp(): void {
+    const listHeight = typeof this.list.height === 'number' ? this.list.height : parseInt(String(this.list.height), 10) || 10;
+    const visibleHeight = Math.max(1, listHeight - 2);
     const halfPage = Math.floor(visibleHeight / 2);
     const newIndex = Math.max(this.list.selected - halfPage, 0);
     this.selectAndScroll(newIndex);
@@ -162,9 +222,10 @@ export class NavigationPanel {
   // Scroll Margin - adjust after blessed's selection
   // ─────────────────────────────────────────────────────────────
 
-  adjustScrollMargin(index) {
+  adjustScrollMargin(index: number) {
     const margin = 2;
-    const visibleHeight = Math.max(1, this.list.height - 2);
+    const listHeight = typeof this.list.height === 'number' ? this.list.height : parseInt(String(this.list.height), 10) || 10;
+    const visibleHeight = Math.max(1, listHeight - 2);
     const scrollTop = this.list.childBase || 0;
     const scrollBottom = scrollTop + visibleHeight - 1;
 
@@ -176,8 +237,9 @@ export class NavigationPanel {
     }
   }
 
-  centerSelection(index) {
-    const visibleHeight = Math.max(1, this.list.height - 2);
+  centerSelection(index: number) {
+    const listHeight = typeof this.list.height === 'number' ? this.list.height : parseInt(String(this.list.height), 10) || 10;
+    const visibleHeight = Math.max(1, listHeight - 2);
     const halfHeight = Math.floor(visibleHeight / 2);
     this.list.childBase = Math.max(0, index - halfHeight);
   }
@@ -186,26 +248,29 @@ export class NavigationPanel {
   // Expand / Collapse
   // ─────────────────────────────────────────────────────────────
 
-  expandOrSelect() {
+  expandOrSelect(): void {
     const index = this.list.selected;
     const item = this.cachedItems[index];
     if (!item) return;
 
     if (item.type === 'track') {
-      this.onSelect({
+      // Handle async callback with error catching
+      Promise.resolve(this.onSelect({
         type: 'track',
         track: item.track,
-        album: this.selectedAlbum,
+        album: this.selectedAlbum ?? undefined,
         trackIndex: item.trackIndex
+      })).catch((err: unknown) => {
+        console.error('onSelect error:', err);
       });
-    } else if (item.type === 'year') {
+    } else if (item.type === 'year' && item.year) {
       this.toggleYear(item.year);
-    } else if (item.type === 'album') {
+    } else if (item.type === 'album' && item.album) {
       this.toggleAlbum(item.album);
     }
   }
 
-  collapse() {
+  collapse(): void {
     const index = this.list.selected;
     const item = this.cachedItems[index];
     if (!item) return;
@@ -217,8 +282,11 @@ export class NavigationPanel {
       for (let i = index - 1; i >= 0; i--) {
         if (this.cachedItems[i].type === 'album') {
           const album = this.cachedItems[i].album;
+          if (!album) continue;
           // Remember track position before collapsing
-          this.lastSelectedTrackInAlbum.set(album.id, item.trackIndex);
+          if (item.trackIndex !== undefined) {
+            this.lastSelectedTrackInAlbum.set(album.id, item.trackIndex);
+          }
           this.expandedAlbums.delete(album.id);
           this.selectedAlbum = null;
           // Calculate new screen offset for parent position
@@ -227,7 +295,7 @@ export class NavigationPanel {
           return;
         }
       }
-    } else if (item.type === 'album') {
+    } else if (item.type === 'album' && item.album) {
       // If album is expanded, collapse it first
       if (this.expandedAlbums.has(item.album.id)) {
         this.expandedAlbums.delete(item.album.id);
@@ -239,6 +307,7 @@ export class NavigationPanel {
       for (let i = index - 1; i >= 0; i--) {
         if (this.cachedItems[i].type === 'year') {
           const year = this.cachedItems[i].year;
+          if (!year) continue;
           // Remember album position before collapsing
           this.lastSelectedAlbumInYear.set(year, item.album.id);
           this.expandedYears.delete(year);
@@ -249,7 +318,7 @@ export class NavigationPanel {
           return;
         }
       }
-    } else if (item.type === 'year') {
+    } else if (item.type === 'year' && item.year) {
       // Collapse year if expanded
       if (this.expandedYears.has(item.year)) {
         this.expandedYears.delete(item.year);
@@ -258,7 +327,7 @@ export class NavigationPanel {
     }
   }
 
-  toggleYear(year) {
+  toggleYear(year: string): void {
     const wasExpanded = this.expandedYears.has(year);
     const currentIndex = this.list.selected;
     const screenOffset = currentIndex - (this.list.childBase || 0);
@@ -269,14 +338,17 @@ export class NavigationPanel {
     } else {
       this.expandedYears.add(year);
       this.selectedYear = year;
-      this.onYearSelect(year);
+      // Handle async callback with error catching
+      Promise.resolve(this.onYearSelect(year)).catch((err: unknown) => {
+        console.error('onYearSelect error:', err);
+      });
       // Rebuild and restore to last album position if available
       const targetIndex = this.findLastAlbumIndex(year);
       this.rebuildAndSelect(targetIndex !== -1 ? targetIndex : currentIndex, screenOffset);
     }
   }
 
-  toggleAlbum(album) {
+  toggleAlbum(album: Album): void {
     const wasExpanded = this.expandedAlbums.has(album.id);
     const currentIndex = this.list.selected;
     const screenOffset = currentIndex - (this.list.childBase || 0);
@@ -288,28 +360,31 @@ export class NavigationPanel {
     } else {
       this.expandedAlbums.add(album.id);
       this.selectedAlbum = album;
-      this.onAlbumSelect(album);
+      // Handle async callback with error catching
+      Promise.resolve(this.onAlbumSelect(album)).catch((err: unknown) => {
+        console.error('onAlbumSelect error:', err);
+      });
       // Rebuild and restore to last track position if available
       const targetIndex = this.findLastTrackIndex(album.id);
       this.rebuildAndSelect(targetIndex !== -1 ? targetIndex : currentIndex, screenOffset);
     }
   }
 
-  findLastAlbumIndex(year) {
+  findLastAlbumIndex(year: string): number {
     const lastAlbumId = this.lastSelectedAlbumInYear.get(year);
     if (!lastAlbumId) return -1;
 
     // Build items first to find the index
     const items = this.buildItems();
     for (let i = 0; i < items.length; i++) {
-      if (items[i].type === 'album' && items[i].album.id === lastAlbumId) {
+      if (items[i].type === 'album' && items[i].album?.id === lastAlbumId) {
         return i;
       }
     }
     return -1;
   }
 
-  findLastTrackIndex(albumId) {
+  findLastTrackIndex(albumId: number): number {
     const lastTrackIndex = this.lastSelectedTrackInAlbum.get(albumId);
     if (lastTrackIndex === undefined) return -1;
 
@@ -321,7 +396,7 @@ export class NavigationPanel {
         // Verify it belongs to this album
         for (let j = i - 1; j >= 0; j--) {
           if (items[j].type === 'album') {
-            if (items[j].album.id === albumId) {
+            if (items[j].album?.id === albumId) {
               return i;
             }
             break;
@@ -336,7 +411,7 @@ export class NavigationPanel {
   // Search
   // ─────────────────────────────────────────────────────────────
 
-  openSearch() {
+  openSearch(): void {
     // Close existing search box if any to prevent duplicates
     if (this.searchBox) {
       this.closeSearchBox();
@@ -356,7 +431,7 @@ export class NavigationPanel {
     this.searchBox.focus();
     this.screen.render();
 
-    this.searchBox.on('submit', (value) => {
+    this.searchBox.on('submit', (value: string) => {
       const query = value.startsWith('/') ? value.slice(1) : value;
       this.performSearch(query);
       this.closeSearchBox();
@@ -373,7 +448,7 @@ export class NavigationPanel {
     this.searchBox.readInput();
   }
 
-  closeSearchBox() {
+  closeSearchBox(): void {
     if (this.searchBox) {
       // Explicitly remove all listeners before destroying
       this.searchBox.removeAllListeners('submit');
@@ -386,7 +461,7 @@ export class NavigationPanel {
     }
   }
 
-  performSearch(query) {
+  performSearch(query: string): void {
     if (!query || query.trim() === '') {
       this.clearSearch();
       return;
@@ -409,19 +484,19 @@ export class NavigationPanel {
     this.updateLabel();
   }
 
-  nextSearchMatch() {
+  nextSearchMatch(): void {
     if (this.searchMatches.length === 0) return;
     this.searchMatchIndex = (this.searchMatchIndex + 1) % this.searchMatches.length;
     this.goToMatch(this.searchMatches[this.searchMatchIndex]);
   }
 
-  prevSearchMatch() {
+  prevSearchMatch(): void {
     if (this.searchMatches.length === 0) return;
     this.searchMatchIndex = (this.searchMatchIndex - 1 + this.searchMatches.length) % this.searchMatches.length;
     this.goToMatch(this.searchMatches[this.searchMatchIndex]);
   }
 
-  goToMatch(index) {
+  goToMatch(index: number): void {
     if (index < 0 || index >= this.cachedItems.length) return;
     this.list.selected = index;
     this.centerSelection(index);
@@ -429,7 +504,7 @@ export class NavigationPanel {
     this.screen.render();
   }
 
-  clearSearch() {
+  clearSearch(): void {
     this.searchQuery = '';
     this.searchMatches = [];
     this.searchMatchIndex = 0;
@@ -441,8 +516,8 @@ export class NavigationPanel {
   // Rendering
   // ─────────────────────────────────────────────────────────────
 
-  buildItems() {
-    const items = [];
+  buildItems(): ListItem[] {
+    const items: ListItem[] = [];
 
     for (const yearInfo of this.years) {
       const year = yearInfo.year;
@@ -489,7 +564,7 @@ export class NavigationPanel {
     return items;
   }
 
-  rebuildAndSelect(targetIndex, preserveScreenOffset = null) {
+  rebuildAndSelect(targetIndex: number, preserveScreenOffset: number | null = null): void {
     this.cachedItems = this.buildItems();
     this.list.setItems(this.cachedItems.map(i => i.text));
 
@@ -500,7 +575,8 @@ export class NavigationPanel {
 
       if (preserveScreenOffset !== null) {
         // Keep selection at same screen position
-        const visibleHeight = Math.max(1, this.list.height - 2);
+        const listHeight = typeof this.list.height === 'number' ? this.list.height : parseInt(String(this.list.height), 10) || 10;
+        const visibleHeight = Math.max(1, listHeight - 2);
         const maxBase = Math.max(0, this.cachedItems.length - visibleHeight);
         let newBase = Math.max(0, newIndex - preserveScreenOffset);
         newBase = Math.min(newBase, maxBase);
@@ -522,7 +598,7 @@ export class NavigationPanel {
     this.screen.render();
   }
 
-  updateLabel() {
+  updateLabel(): void {
     let label = ' Navigation ';
 
     if (this.searchMatches.length > 0) {
@@ -540,7 +616,7 @@ export class NavigationPanel {
     this.box.setLabel(label);
   }
 
-  truncate(str, maxLen) {
+  truncate(str: string, maxLen: number): string {
     if (!str) return '';
     if (str.length <= maxLen) return str;
     return str.substring(0, maxLen - 2) + '..';
@@ -550,18 +626,18 @@ export class NavigationPanel {
   // Public API
   // ─────────────────────────────────────────────────────────────
 
-  setYears(years) {
+  setYears(years: YearDisplayItem[]): void {
     this.years = years;
     this.refreshPlayedStatus();
     this.rebuildAndSelect(0);
   }
 
-  refreshPlayedStatus() {
+  refreshPlayedStatus(): void {
     this.playedAlbums = albumRepo.getPlayedAlbumIds();
     this.playedTracks = trackRepo.getPlayedTrackIds();
   }
 
-  markTrackCompleted(trackId, albumId) {
+  markTrackCompleted(trackId: number, albumId: number): void {
     if (trackId) {
       trackRepo.setPlayed(trackId, true);
       this.playedTracks.add(trackId);
@@ -576,7 +652,7 @@ export class NavigationPanel {
     this.rebuildAndSelect(currentIndex);
   }
 
-  toggleTrackPlayed(trackId, albumId) {
+  toggleTrackPlayed(trackId: number, albumId: number): void {
     if (!trackId) return;
 
     const isPlayed = this.playedTracks.has(trackId);
@@ -602,7 +678,7 @@ export class NavigationPanel {
     this.rebuildAndSelect(currentIndex);
   }
 
-  toggleAlbumPlayed(albumId) {
+  toggleAlbumPlayed(albumId: number): void {
     if (!albumId) return;
 
     const isPlayed = this.playedAlbums.has(albumId);
@@ -631,12 +707,12 @@ export class NavigationPanel {
     this.rebuildAndSelect(currentIndex);
   }
 
-  getSelectedItem() {
+  getSelectedItem(): ListItem | null {
     const index = this.list.selected;
     return this.cachedItems[index] || null;
   }
 
-  saveCurrentPosition() {
+  saveCurrentPosition(): void {
     // Save the current list selection index directly
     const selectedIndex = this.list.selected || 0;
 
@@ -647,7 +723,7 @@ export class NavigationPanel {
     playbackRepo.saveNavPosition(selectedIndex, expandedYears, expandedAlbums);
   }
 
-  async restoreLastPosition() {
+  async restoreLastPosition(): Promise<boolean> {
     const pos = playbackRepo.getNavPosition();
     if (!pos || (pos.expandedYears.length === 0 && pos.selectedIndex === 0)) {
       return false;
@@ -685,22 +761,23 @@ export class NavigationPanel {
       this.screen.render();
 
       return true;
-    } catch (error) {
+    } catch (error: unknown) {
       // Log error but don't crash - restore failed gracefully
-      console.error('Failed to restore navigation position:', error.message);
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      console.error('Failed to restore navigation position:', message);
       return false;
     } finally {
       this.isRestoring = false;
     }
   }
 
-  async loadYearAlbums(year) {
+  async loadYearAlbums(year: string): Promise<void> {
     // This will be called by App to load albums
     this.selectedYear = year;
     await this.onYearSelect(year);
   }
 
-  async loadAlbumTracks(albumId) {
+  async loadAlbumTracks(albumId: number): Promise<void> {
     // Find album in loaded albums
     for (const year in this.albums) {
       const album = this.albums[year]?.find(a => a.id === albumId);
@@ -712,7 +789,7 @@ export class NavigationPanel {
     }
   }
 
-  updateYearAlbumCount(year, count) {
+  updateYearAlbumCount(year: string, count: number): void {
     const yearData = this.years.find(y => y.year === year);
     if (yearData) {
       yearData.album_count = count;
@@ -722,7 +799,7 @@ export class NavigationPanel {
     }
   }
 
-  setAlbumsForYear(year, albums) {
+  setAlbumsForYear(year: string, albums: Album[]): void {
     this.albums[year] = albums;
 
     // Skip rebuild if restoring - let restoreLastPosition handle it
@@ -736,7 +813,7 @@ export class NavigationPanel {
     this.rebuildAndSelect(targetIndex !== -1 ? targetIndex : currentIndex, screenOffset);
   }
 
-  setTracksForAlbum(albumId, tracks) {
+  setTracksForAlbum(albumId: number, tracks: Track[]): void {
     this.tracks[albumId] = tracks;
 
     // Skip rebuild if restoring - let restoreLastPosition handle it
@@ -750,17 +827,17 @@ export class NavigationPanel {
     this.rebuildAndSelect(targetIndex !== -1 ? targetIndex : currentIndex, screenOffset);
   }
 
-  render() {
+  render(): void {
     this.rebuildAndSelect(this.list.selected || 0);
   }
 
-  focus() {
+  focus(): void {
     this.box.style.border.fg = 'white';
     this.list.focus();
     this.screen.render();
   }
 
-  blur() {
+  blur(): void {
     // Close search box when panel loses focus
     if (this.searchBox) {
       this.closeSearchBox();
@@ -769,24 +846,24 @@ export class NavigationPanel {
     this.screen.render();
   }
 
-  getBox() {
+  getBox(): blessed.Widgets.BoxElement {
     return this.box;
   }
 
-  getListItems() {
+  getListItems(): ListItem[] {
     return this.cachedItems;
   }
 
-  refreshCurrentAlbum() {
+  refreshCurrentAlbum(): void {
     // Refresh album data from database and rebuild
     if (this.selectedAlbum) {
-      const freshAlbum = albumRepo.getById(this.selectedAlbum.id);
+      const freshAlbum = albumRepo.getById(this.selectedAlbum.id) as Album | undefined;
       if (freshAlbum) {
         // Update in albums cache
         for (const year in this.albums) {
           const idx = this.albums[year]?.findIndex(a => a.id === freshAlbum.id);
           // Check idx >= 0 because findIndex returns -1 if not found, undefined if array is undefined
-          if (idx >= 0) {
+          if (idx !== undefined && idx >= 0) {
             this.albums[year][idx] = freshAlbum;
             break;
           }
@@ -797,12 +874,12 @@ export class NavigationPanel {
 
     // Also refresh any visible album in the current selection
     const item = this.getSelectedItem();
-    if (item?.type === 'album') {
-      const freshAlbum = albumRepo.getById(item.album.id);
+    if (item?.type === 'album' && item.album) {
+      const freshAlbum = albumRepo.getById(item.album.id) as Album | undefined;
       if (freshAlbum) {
         for (const year in this.albums) {
           const idx = this.albums[year]?.findIndex(a => a.id === freshAlbum.id);
-          if (idx >= 0) {
+          if (idx !== undefined && idx >= 0) {
             this.albums[year][idx] = freshAlbum;
             break;
           }

@@ -6,6 +6,7 @@ import { trackRepo } from '../data/repositories/track-repo.js';
 import { historyRepo } from '../data/repositories/history-repo.js';
 import { storageManager } from '../storage/manager.js';
 import { PlaybackState, PlaybackMode } from '../constants.js';
+import type { Album, Track, IKhinsiderScraper, PlaybackStatus, PlayEventData, ErrorEventData } from '../types/index.js';
 
 export { PlaybackState, PlaybackMode };
 
@@ -13,7 +14,20 @@ export { PlaybackState, PlaybackMode };
 const MAX_SKIP = 10;
 
 export class PlaybackController extends EventEmitter {
-  constructor(scraper) {
+  scraper: IKhinsiderScraper;
+  state: string;
+  mode: string;
+  currentYear: string | null;
+  yearAlbums: Album[];
+  yearAlbumIndex: number;
+  currentAlbum: Album | null;
+  currentTracks: Track[];
+  currentTrackIndex: number;
+  _boundListeners: Record<string, (...args: unknown[]) => void>;
+  _isStopping: boolean;
+  _isAdvancing: boolean;
+
+  constructor(scraper: IKhinsiderScraper) {
     super();
     this.scraper = scraper;
     this.state = PlaybackState.IDLE;
@@ -39,10 +53,11 @@ export class PlaybackController extends EventEmitter {
 
   setupPlayerEvents() {
     // Store bound listeners for later cleanup
-    this._boundListeners.play = (data) => {
+    this._boundListeners.play = (data: unknown) => {
+      const eventData = data as PlayEventData;
       this.state = PlaybackState.PLAYING;
       this.emit('trackStart', {
-        track: data.track,
+        track: eventData.track,
         album: this.currentAlbum,
         trackIndex: this.currentTrackIndex,
         totalTracks: this.currentTracks.length
@@ -55,27 +70,36 @@ export class PlaybackController extends EventEmitter {
         return;
       }
 
+      // Record history and mark as completed (non-critical, don't block playback)
       try {
-        // Record history and mark as completed
         const track = this.currentTracks[this.currentTrackIndex];
         if (track) {
-          historyRepo.addTrackPlay(track, this.currentAlbum);
+          try {
+            historyRepo.addTrackPlay(track, this.currentAlbum);
+          } catch {
+            // Ignore history recording errors
+          }
           this.emit('trackCompleted', {
             track,
             album: this.currentAlbum
           });
         }
+      } catch (error: unknown) {
+        // Log but don't stop playback for history/emit errors
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('Track completion error:', message);
+      }
 
-        // Auto advance to next track with mutex (call playTrackByIndex directly)
-        if (this.currentTracks.length === 0) return;
-        this._isAdvancing = true;
-        try {
-          await this.playTrackByIndex(this.currentTrackIndex + 1);
-        } finally {
-          this._isAdvancing = false;
-        }
-      } catch (error) {
-        this.emit('error', { message: `Track ended error: ${error.message}` });
+      // Auto advance to next track with mutex
+      if (this.currentTracks.length === 0) return;
+      this._isAdvancing = true;
+      try {
+        await this.playTrackByIndex(this.currentTrackIndex + 1);
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : 'Unknown error';
+        this.emit('error', { message: `Track advance error: ${msg}` });
+      } finally {
+        this._isAdvancing = false;
       }
     };
 
@@ -96,9 +120,9 @@ export class PlaybackController extends EventEmitter {
       this.emit('stopped', { track, album });
     };
 
-    this._boundListeners.error = (data) => {
+    this._boundListeners.error = (data: unknown) => {
       this.state = PlaybackState.ERROR;
-      this.emit('error', data);
+      this.emit('error', data as ErrorEventData);
     };
 
     this._boundListeners.loading = () => {
@@ -118,7 +142,7 @@ export class PlaybackController extends EventEmitter {
 
   // Cleanup method to remove all listeners
   cleanup() {
-    if (this._boundListeners.play) {
+    if (this._boundListeners && this._boundListeners.play) {
       audioPlayer.off('play', this._boundListeners.play);
       audioPlayer.off('ended', this._boundListeners.ended);
       audioPlayer.off('pause', this._boundListeners.pause);
@@ -130,7 +154,7 @@ export class PlaybackController extends EventEmitter {
     }
   }
 
-  async playYear(year, startAlbumIndex = 0) {
+  async playYear(year: string, startAlbumIndex = 0): Promise<boolean> {
     this.mode = PlaybackMode.YEAR_SEQUENTIAL;
     this.currentYear = year;
     this.yearAlbumIndex = startAlbumIndex;
@@ -152,7 +176,7 @@ export class PlaybackController extends EventEmitter {
         url: album.url,
         year: year,
         platform: album.platform
-      });
+      }) as Album;
       this.yearAlbums.push(dbAlbum);
     }
 
@@ -168,60 +192,74 @@ export class PlaybackController extends EventEmitter {
     return await this.playAlbumByIndex(startAlbumIndex);
   }
 
-  async playAlbum(album, startTrackIndex = 0) {
-    this.mode = PlaybackMode.ALBUM;
-    this.currentAlbum = album;
-    this.currentTrackIndex = 0;
-
-    // Fetch tracks
-    this.emit('loadingAlbum', { album });
-
-    let tracks;
-
-    // Check if we have tracks in DB
-    const dbTracks = trackRepo.getByAlbumId(album.id);
-    if (dbTracks && dbTracks.length > 0) {
-      tracks = dbTracks;
-    } else {
-      // Fetch from web
-      const webTracks = await this.scraper.getAlbumTracks(album.url);
-      if (!webTracks || webTracks.length === 0) {
-        this.emit('error', { message: `No tracks found for album: ${album.title}` });
-        return false;
-      }
-
-      // Save tracks to DB
-      const tracksToInsert = webTracks.map((t, i) => ({
-        albumId: album.id,
-        trackNumber: i + 1,
-        name: t.name,
-        duration: t.duration,
-        pageUrl: t.pageUrl,
-        fileSize: t.mp3Size
-      }));
-
-      trackRepo.createMany(tracksToInsert);
-      tracks = trackRepo.getByAlbumId(album.id);
-
-      // Update album track count
-      albumRepo.update(album.id, { trackCount: tracks.length });
+  async playAlbum(album: Album, startTrackIndex = 0): Promise<boolean> {
+    // Validate album
+    if (!album || !album.id) {
+      this.emit('error', { message: 'Invalid album' });
+      return false;
     }
 
-    this.currentTracks = tracks;
+    // Prevent concurrent playback operations
+    if (this._isAdvancing) return false;
+    this._isAdvancing = true;
 
-    // Save state
-    playbackRepo.setAlbumMode(album.id);
+    try {
+      this.mode = PlaybackMode.ALBUM;
+      this.currentAlbum = album;
+      this.currentTrackIndex = 0;
 
-    this.emit('albumLoaded', {
-      album,
-      trackCount: tracks.length
-    });
+      // Fetch tracks
+      this.emit('loadingAlbum', { album });
 
-    // Start playing specified track
-    return await this.playTrackByIndex(startTrackIndex);
+      let tracks;
+
+      // Check if we have tracks in DB
+      const dbTracks = trackRepo.getByAlbumId(album.id);
+      if (dbTracks && dbTracks.length > 0) {
+        tracks = dbTracks;
+      } else {
+        // Fetch from web
+        const webTracks = await this.scraper.getAlbumTracks(album.url);
+        if (!webTracks || webTracks.length === 0) {
+          this.emit('error', { message: `No tracks found for album: ${album.title}` });
+          return false;
+        }
+
+        // Save tracks to DB
+        const tracksToInsert = webTracks.map((t, i) => ({
+          albumId: album.id,
+          trackNumber: i + 1,
+          name: t.name,
+          duration: t.duration,
+          pageUrl: t.pageUrl,
+          fileSize: t.mp3Size
+        }));
+
+        trackRepo.createMany(tracksToInsert);
+        tracks = trackRepo.getByAlbumId(album.id);
+
+        // Update album track count
+        albumRepo.update(album.id, { trackCount: tracks.length });
+      }
+
+      this.currentTracks = tracks;
+
+      // Save state
+      playbackRepo.setAlbumMode(album.id);
+
+      this.emit('albumLoaded', {
+        album,
+        trackCount: tracks.length
+      });
+
+      // Start playing specified track (don't use lock again - we already hold it)
+      return await this.playTrackByIndex(startTrackIndex);
+    } finally {
+      this._isAdvancing = false;
+    }
   }
 
-  async playAlbumByIndex(index) {
+  async playAlbumByIndex(index: number): Promise<boolean> {
     // Bounds check
     if (index < 0 || index >= this.yearAlbums.length) {
       if (index >= this.yearAlbums.length) {
@@ -252,32 +290,48 @@ export class PlaybackController extends EventEmitter {
     return await this.playAlbum(album);
   }
 
-  async playTrackByIndex(index, skipCount = 0) {
+  async playTrackByIndex(index: number, skipCount = 0): Promise<boolean> {
+    // Check if stopping - exit early
+    if (this._isStopping) {
+      return false;
+    }
+
     // Use iteration instead of recursion to prevent stack overflow
     let currentIndex = index < 0 ? 0 : index;
     let currentSkipCount = skipCount;
 
+    // Capture current state to prevent race conditions during async operations
+    const capturedAlbum = this.currentAlbum;
+    const capturedTracks = this.currentTracks;
+    const capturedMode = this.mode;
+    const capturedYearAlbumIndex = this.yearAlbumIndex;
+
     while (currentSkipCount < MAX_SKIP) {
-      // Bounds check
-      if (currentIndex >= this.currentTracks.length) {
+      // Check if stopping during iteration
+      if (this._isStopping) {
+        return false;
+      }
+
+      // Bounds check using captured tracks
+      if (currentIndex >= capturedTracks.length) {
         // Album complete
-        if (this.mode === PlaybackMode.YEAR_SEQUENTIAL) {
+        if (capturedMode === PlaybackMode.YEAR_SEQUENTIAL) {
           // Move to next album in year
           this.emit('albumComplete', {
-            album: this.currentAlbum,
-            albumIndex: this.yearAlbumIndex
+            album: capturedAlbum,
+            albumIndex: capturedYearAlbumIndex
           });
-          return await this.playAlbumByIndex(this.yearAlbumIndex + 1);
+          return await this.playAlbumByIndex(capturedYearAlbumIndex + 1);
         } else {
           // Single album mode - stop
-          this.emit('albumComplete', { album: this.currentAlbum });
+          this.emit('albumComplete', { album: capturedAlbum });
           this.state = PlaybackState.IDLE;
           return false;
         }
       }
 
       this.currentTrackIndex = currentIndex;
-      const track = this.currentTracks[currentIndex];
+      const track = capturedTracks[currentIndex];
 
       // Null check for track
       if (!track) {
@@ -294,10 +348,10 @@ export class PlaybackController extends EventEmitter {
       // Check local file first
       if (track.local_path && await storageManager.fileExists(track.local_path)) {
         audioSource = track.local_path;
-      } else if (track.is_downloaded && this.currentAlbum) {
-        // Try to find local file
-        const slug = this.currentAlbum.slug;
-        const year = this.currentAlbum.year || 'unknown';
+      } else if (track.is_downloaded && capturedAlbum?.slug) {
+        // Try to find local file using captured album reference
+        const slug = capturedAlbum.slug;
+        const year = capturedAlbum.year || 'unknown';
         const localPath = storageManager.getTrackPath(
           year,
           slug,
@@ -325,7 +379,7 @@ export class PlaybackController extends EventEmitter {
                 // Ignore cache update errors
               }
             }
-          } catch (error) {
+          } catch {
             this.emit('error', { message: `Failed to get URL for: ${track.name}` });
           }
         }
@@ -339,16 +393,16 @@ export class PlaybackController extends EventEmitter {
         continue;
       }
 
-      // Play
+      // Play with captured album title (with fallback)
       try {
         await audioPlayer.play(audioSource, {
           id: track.id,
           name: track.name,
           duration: track.duration,
-          albumTitle: this.currentAlbum?.title
+          albumTitle: capturedAlbum?.title || 'Unknown Album'
         });
         return true;
-      } catch (error) {
+      } catch {
         // Handle play errors and try next track
         currentIndex++;
         currentSkipCount++;
@@ -362,7 +416,7 @@ export class PlaybackController extends EventEmitter {
     return false;
   }
 
-  async next() {
+  async next(): Promise<boolean> {
     if (this._isAdvancing || this.currentTracks.length === 0) return false;
     this._isAdvancing = true;
     try {
@@ -372,7 +426,7 @@ export class PlaybackController extends EventEmitter {
     }
   }
 
-  async previous() {
+  async previous(): Promise<boolean> {
     if (this._isAdvancing || this.currentTracks.length === 0) return false;
     this._isAdvancing = true;
     try {
@@ -383,7 +437,7 @@ export class PlaybackController extends EventEmitter {
     }
   }
 
-  async nextAlbum() {
+  async nextAlbum(): Promise<boolean> {
     if (this._isAdvancing || this.mode !== PlaybackMode.YEAR_SEQUENTIAL) return false;
     this._isAdvancing = true;
     try {
@@ -393,7 +447,7 @@ export class PlaybackController extends EventEmitter {
     }
   }
 
-  async previousAlbum() {
+  async previousAlbum(): Promise<boolean> {
     if (this._isAdvancing || this.mode !== PlaybackMode.YEAR_SEQUENTIAL) return false;
     this._isAdvancing = true;
     try {
@@ -404,11 +458,11 @@ export class PlaybackController extends EventEmitter {
     }
   }
 
-  togglePause() {
+  togglePause(): boolean {
     return audioPlayer.togglePause();
   }
 
-  async stop() {
+  async stop(): Promise<void> {
     this._isStopping = true;
     try {
       await audioPlayer.stop();
@@ -419,7 +473,7 @@ export class PlaybackController extends EventEmitter {
     }
   }
 
-  getStatus() {
+  getStatus(): PlaybackStatus {
     const currentTrack = (this.currentTrackIndex >= 0 && this.currentTrackIndex < this.currentTracks.length)
       ? this.currentTracks[this.currentTrackIndex]
       : null;
@@ -439,16 +493,28 @@ export class PlaybackController extends EventEmitter {
     };
   }
 
-  async restoreSession() {
+  async restoreSession(): Promise<boolean> {
     const state = playbackRepo.getState();
-    if (!state || state.mode === 'idle') {
+    if (!state) {
       return false;
     }
 
-    if (state.mode === 'year_sequential' && state.current_year) {
-      return await this.playYear(state.current_year, state.year_album_index || 0);
-    } else if (state.mode === 'album' && state.current_album_id) {
-      const album = albumRepo.getById(state.current_album_id);
+    // Type assertion after null check
+    const typedState = state as {
+      mode: string;
+      current_year: string | null;
+      year_album_index: number;
+      current_album_id: number | null;
+    };
+
+    if (typedState.mode === 'idle') {
+      return false;
+    }
+
+    if (typedState.mode === 'year_sequential' && typedState.current_year) {
+      return await this.playYear(typedState.current_year, typedState.year_album_index || 0);
+    } else if (typedState.mode === 'album' && typedState.current_album_id) {
+      const album = albumRepo.getById(typedState.current_album_id) as Album | undefined;
       if (album) {
         return await this.playAlbum(album);
       }
@@ -458,6 +524,6 @@ export class PlaybackController extends EventEmitter {
   }
 }
 
-export function createPlaybackController(scraper) {
+export function createPlaybackController(scraper: IKhinsiderScraper): PlaybackController {
   return new PlaybackController(scraper);
 }

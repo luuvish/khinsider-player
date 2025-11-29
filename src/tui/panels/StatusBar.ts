@@ -2,10 +2,20 @@ import blessed from 'blessed';
 import { getStatusBarText } from '../utils/keyBindings.js';
 
 export class StatusBar {
-  constructor(screen) {
+  screen: blessed.Widgets.Screen;
+  message: string;
+  messageTimeout: ReturnType<typeof setTimeout> | null;
+  box: blessed.Widgets.BoxElement;
+  content: blessed.Widgets.TextElement | null;
+
+  constructor(screen: blessed.Widgets.Screen) {
     this.screen = screen;
     this.message = '';
     this.messageTimeout = null;
+
+    // Initialize UI elements (assigned in createPanel)
+    this.box = null!;
+    this.content = null;
 
     this.createPanel();
   }
@@ -38,7 +48,7 @@ export class StatusBar {
     });
   }
 
-  showMessage(message, duration = 3000) {
+  showMessage(message: string, duration = 3000): void {
     if (this.messageTimeout) {
       clearTimeout(this.messageTimeout);
     }
@@ -57,15 +67,15 @@ export class StatusBar {
     }, duration);
   }
 
-  showError(message) {
+  showError(message: string): void {
     this.showMessage(`{red-fg}Error: ${message}{/red-fg}`, 5000);
   }
 
-  showSuccess(message) {
+  showSuccess(message: string): void {
     this.showMessage(`{green-fg}${message}{/green-fg}`, 3000);
   }
 
-  showInfo(message) {
+  showInfo(message: string): void {
     this.showMessage(`{cyan-fg}${message}{/cyan-fg}`, 3000);
   }
 

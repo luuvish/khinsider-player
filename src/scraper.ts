@@ -1,7 +1,17 @@
-import axios from 'axios';
+import axios, { AxiosResponse } from 'axios';
 import * as cheerio from 'cheerio';
+import type { Element } from 'domhandler';
 import { wrapper } from 'axios-cookiejar-support';
 import { CookieJar } from 'tough-cookie';
+import type {
+  LoginResult,
+  SearchResult,
+  AlbumInfo,
+  ScrapedTrack,
+  TrackUrls,
+  BulkDownloadUrls,
+  StreamResponse
+} from './types/index.js';
 
 // Rate limiting configuration
 const RATE_LIMIT_DELAY = 500; // 500ms between requests
@@ -15,7 +25,28 @@ const ALLOWED_DOMAINS = [
   'vgmtreasurechest.com'
 ];
 
+interface RequestOptions {
+  headers?: Record<string, string>;
+  timeout?: number;
+  params?: Record<string, string>;
+}
+
+interface AxiosError {
+  response?: {
+    status: number;
+  };
+}
+
 class KhinsiderScraper {
+  baseUrl: string;
+  forumUrl: string;
+  userAgent: string;
+  cookieJar: CookieJar;
+  client: ReturnType<typeof wrapper>;
+  isLoggedIn: boolean;
+  lastRequestTime: number;
+  _requestLock: Promise<void> | null;
+
   constructor() {
     this.baseUrl = 'https://downloads.khinsider.com';
     this.forumUrl = 'https://downloads.khinsider.com/forums';
@@ -36,15 +67,15 @@ class KhinsiderScraper {
   }
 
   // Rate limiting helper using mutex pattern (avoids infinite promise chain)
-  async rateLimitedRequest(fn) {
+  async rateLimitedRequest<T>(fn: () => Promise<T>): Promise<T> {
     // Wait for any pending request to complete
     while (this._requestLock) {
       await this._requestLock;
     }
 
-    // Create a new lock
-    let releaseLock;
-    this._requestLock = new Promise(resolve => { releaseLock = resolve; });
+    // Create a new lock with guaranteed releaseLock assignment
+    let releaseLock: (() => void) | null = null;
+    this._requestLock = new Promise<void>(resolve => { releaseLock = resolve; });
 
     try {
       const now = Date.now();
@@ -58,17 +89,20 @@ class KhinsiderScraper {
       return await fn();
     } finally {
       // Release lock before nullifying to prevent race condition
-      releaseLock();
+      // Check releaseLock exists to handle edge cases
+      if (releaseLock) {
+        releaseLock();
+      }
       this._requestLock = null;
     }
   }
 
-  delay(ms) {
+  delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   // Validate URL domain against whitelist
-  validateUrl(url) {
+  validateUrl(url: string): string {
     try {
       const parsed = new URL(url);
       const isAllowed = ALLOWED_DOMAINS.some(domain =>
@@ -78,8 +112,9 @@ class KhinsiderScraper {
         throw new Error(`URL domain not allowed: ${parsed.hostname}`);
       }
       return url;
-    } catch (error) {
-      if (error.message.includes('not allowed')) {
+    } catch (error: unknown) {
+      // Safely check error message
+      if (error instanceof Error && error.message.includes('not allowed')) {
         throw error;
       }
       throw new Error(`Invalid URL: ${url}`);
@@ -87,14 +122,14 @@ class KhinsiderScraper {
   }
 
   // Build and validate full URL from href
-  buildUrl(href) {
-    if (!href) return null;
+  buildUrl(href: string | null | undefined): string | null {
+    if (!href || typeof href !== 'string') return null;
     const fullUrl = href.startsWith('http') ? href : this.baseUrl + href;
     return this.validateUrl(fullUrl);
   }
 
   // Validate HTTP response status
-  validateResponse(response, url) {
+  validateResponse<T>(response: AxiosResponse<T>, url: string): AxiosResponse<T> {
     if (response.status >= 400) {
       throw new Error(`HTTP ${response.status} error for ${url}`);
     }
@@ -112,7 +147,7 @@ class KhinsiderScraper {
     return response;
   }
 
-  async makeRequest(url, options = {}) {
+  async makeRequest(url: string, options: RequestOptions = {}): Promise<AxiosResponse<string>> {
     const defaultHeaders = {
       'User-Agent': this.userAgent,
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -125,11 +160,11 @@ class KhinsiderScraper {
     };
 
     return this.rateLimitedRequest(async () => {
-      let lastError;
+      let lastError: unknown;
 
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
-          const response = await this.client.get(url, {
+          const response = await this.client.get<string>(url, {
             headers: { ...defaultHeaders, ...options.headers },
             timeout: 30000,
             validateStatus: () => true, // Don't throw on HTTP errors
@@ -137,11 +172,12 @@ class KhinsiderScraper {
           });
 
           return this.validateResponse(response, url);
-        } catch (error) {
+        } catch (error: unknown) {
           lastError = error;
 
           // Don't retry on client errors (4xx except 429)
-          if (error.response?.status >= 400 && error.response?.status < 500 && error.response?.status !== 429) {
+          const axiosErr = error as AxiosError;
+          if (axiosErr.response?.status && axiosErr.response.status >= 400 && axiosErr.response.status < 500 && axiosErr.response.status !== 429) {
             throw error;
           }
 
@@ -152,11 +188,11 @@ class KhinsiderScraper {
         }
       }
 
-      throw lastError;
+      throw lastError || new Error('Request failed after all retries');
     });
   }
 
-  async makePost(url, data, options = {}) {
+  async makePost(url: string, data: string, options: RequestOptions = {}): Promise<AxiosResponse<string>> {
     const defaultHeaders = {
       'User-Agent': this.userAgent,
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -166,7 +202,7 @@ class KhinsiderScraper {
     };
 
     return this.rateLimitedRequest(async () => {
-      const response = await this.client.post(url, data, {
+      const response = await this.client.post<string>(url, data, {
         headers: { ...defaultHeaders, ...options.headers },
         timeout: 30000,
         maxRedirects: 5,
@@ -179,7 +215,7 @@ class KhinsiderScraper {
   }
 
   // Rate-limited streaming request for file downloads
-  async makeStreamRequest(url, options = {}) {
+  async makeStreamRequest(url: string, options: RequestOptions = {}): Promise<StreamResponse> {
     const defaultHeaders = {
       'User-Agent': this.userAgent,
       'Accept': '*/*',
@@ -200,7 +236,11 @@ class KhinsiderScraper {
         throw new Error(`HTTP ${response.status} error for ${url}`);
       }
 
-      return response;
+      return {
+        data: response.data,
+        headers: response.headers as Record<string, string>,
+        status: response.status
+      };
     });
   }
 
@@ -208,7 +248,7 @@ class KhinsiderScraper {
   // Authentication
   // ─────────────────────────────────────────────────────────────
 
-  async login(username, password) {
+  async login(username: string, password: string): Promise<LoginResult> {
     try {
       // Step 1: Get login page to get CSRF token
       const loginPageUrl = `${this.forumUrl}/index.php?login/`;
@@ -226,7 +266,7 @@ class KhinsiderScraper {
         login: username,
         password: password,
         remember: '1',
-        _xfToken: csrfToken,
+        _xfToken: String(csrfToken),
         _xfRedirect: this.baseUrl
       });
 
@@ -249,13 +289,13 @@ class KhinsiderScraper {
       this.isLoggedIn = isLoggedIn;
       return { success: isLoggedIn };
 
-    } catch (error) {
+    } catch (error: unknown) {
       this.isLoggedIn = false;
       throw error;
     }
   }
 
-  async checkLoginStatus() {
+  async checkLoginStatus(): Promise<boolean> {
     try {
       const response = await this.makeRequest(`${this.forumUrl}/`);
       const isLoggedIn = response.data.includes('data-logged-in="true"');
@@ -266,7 +306,7 @@ class KhinsiderScraper {
     }
   }
 
-  async logout() {
+  async logout(): Promise<void> {
     this.cookieJar = new CookieJar();
     this.client = wrapper(axios.create({
       jar: this.cookieJar,
@@ -276,7 +316,7 @@ class KhinsiderScraper {
   }
 
   // Get album download ID from album page (for bulk download)
-  async getAlbumDownloadId(albumUrl) {
+  async getAlbumDownloadId(albumUrl: string): Promise<string | null> {
     try {
       const response = await this.makeRequest(albumUrl);
       const $ = cheerio.load(response.data);
@@ -291,15 +331,16 @@ class KhinsiderScraper {
       }
       // No bulk download link found (normal for some albums)
       return null;
-    } catch (error) {
+    } catch (error: unknown) {
       // Log network/parsing errors for debugging
-      console.error(`getAlbumDownloadId error for ${albumUrl}:`, error.message);
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`getAlbumDownloadId error for ${albumUrl}:`, message);
       return null;
     }
   }
 
   // Get bulk download URLs for MP3 and FLAC (from album page)
-  async getBulkDownloadUrls(albumUrl) {
+  async getBulkDownloadUrls(albumUrl: string): Promise<BulkDownloadUrls> {
     try {
       const response = await this.makeRequest(albumUrl);
       const $ = cheerio.load(response.data);
@@ -329,43 +370,47 @@ class KhinsiderScraper {
       if (!urls.mp3Url && !urls.flacUrl) {
         const addAlbumLink = $('a[href*="/cp/add_album/"]').attr('href');
         if (addAlbumLink) {
-          const addAlbumUrl = this.buildUrl(addAlbumLink);
+          try {
+            const addAlbumUrl = this.buildUrl(addAlbumLink);
 
-          // Follow the add_album link to get to download page
-          const downloadPageResponse = await this.makeRequest(addAlbumUrl);
-          const $dl = cheerio.load(downloadPageResponse.data);
+            // Follow the add_album link to get to download page
+            const downloadPageResponse = await this.makeRequest(addAlbumUrl);
+            const $dl = cheerio.load(downloadPageResponse.data);
 
-          // Look for ZIP links on the download page
-          $dl('a[href*=".zip"]').each((_, el) => {
-            const href = $dl(el).attr('href');
-            const text = $dl(el).text().toLowerCase();
+            // Look for ZIP links on the download page
+            $dl('a[href*=".zip"]').each((_, el) => {
+              const href = $dl(el).attr('href');
+              const text = $dl(el).text().toLowerCase();
 
-            if (!href) return;
+              if (!href) return;
 
-            try {
-              const fullUrl = this.buildUrl(href);
-              if (text.includes('flac') || href.includes('flac')) {
-                urls.flacUrl = fullUrl;
-              } else if (text.includes('mp3') || href.includes('mp3')) {
-                urls.mp3Url = fullUrl;
-              } else if (!urls.mp3Url) {
-                // Fallback: use first zip link as mp3
-                urls.mp3Url = fullUrl;
+              try {
+                const fullUrl = this.buildUrl(href);
+                if (text.includes('flac') || href.includes('flac')) {
+                  urls.flacUrl = fullUrl;
+                } else if (text.includes('mp3') || href.includes('mp3')) {
+                  urls.mp3Url = fullUrl;
+                } else if (!urls.mp3Url) {
+                  // Fallback: use first zip link as mp3
+                  urls.mp3Url = fullUrl;
+                }
+              } catch {
+                // Skip invalid URLs
               }
-            } catch {
-              // Skip invalid URLs
-            }
-          });
+            });
+          } catch {
+            // Skip if add_album link is invalid or request fails
+          }
         }
       }
 
       return urls;
-    } catch (error) {
-      throw error;
+    } catch {
+      return { mp3Url: null, flacUrl: null };
     }
   }
 
-  async searchAlbums(query) {
+  async searchAlbums(query: string): Promise<SearchResult[]> {
     // Validate search query
     if (!query || typeof query !== 'string') {
       return [];
@@ -386,42 +431,42 @@ class KhinsiderScraper {
       const response = await this.makeRequest(`${this.baseUrl}/search`, {
         params: { search: trimmedQuery }
       });
-      
+
       const $ = cheerio.load(response.data);
-      const albums = [];
-      
+      const albums: SearchResult[] = [];
+
       // Target the specific albumList table structure
       $('table.albumList tbody tr').each((index, element) => {
         const $row = $(element);
         const cells = $row.find('td');
-        
+
         // Skip header rows or rows without enough cells
         if (cells.length < 4) return;
-        
+
         // Find album links - there are usually multiple links per row
         // We want the one with meaningful text content
         const albumLinks = $row.find('a[href*="/game-soundtracks/album/"]');
-        
-        let bestLink = null;
+
+        let bestLink: cheerio.Cheerio<Element> | null = null;
         let bestTitle = '';
-        
+
         // Find the link with the most descriptive text (longest non-empty text)
         albumLinks.each((i, link) => {
           const $link = $(link);
           const text = $link.text().trim();
-          
+
           if (text && text.length > bestTitle.length) {
             bestLink = $link;
             bestTitle = text;
           }
         });
-        
+
         if (bestLink && bestTitle) {
           // Extract platform, type, and year from the remaining cells
           const platform = cells.eq(1).text().trim() || 'Unknown';
           const type = cells.eq(2).text().trim() || 'Soundtrack';
           const year = cells.eq(3).text().trim() || 'Unknown';
-          
+
           albums.push({
             title: bestTitle,
             url: this.baseUrl + bestLink.attr('href'),
@@ -434,25 +479,31 @@ class KhinsiderScraper {
 
       return albums;
 
-    } catch (error) {
+    } catch (error: unknown) {
       // Log error for debugging before returning empty results
-      console.error(`Search error for query "${trimmedQuery}":`, error.message);
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Search error for query "${trimmedQuery}":`, message);
       return [];
     }
   }
 
-  async getAlbumInfo(albumUrl) {
+  async getAlbumInfo(albumUrl: string): Promise<AlbumInfo> {
     try {
       const response = await this.makeRequest(albumUrl);
       const $ = cheerio.load(response.data);
 
-      const info = {
+      const info: {
+        images: string[];
+        metadata: Record<string, string>;
+        metadataLines: { label: string; value: string }[];
+      } = {
         images: [],
-        metadata: {}
+        metadata: {},
+        metadataLines: []
       };
 
       // Get album images from various sources
-      const imageSet = new Set();
+      const imageSet = new Set<string>();
 
       // Album art links - look for links to actual album images (vgmtreasurechest domain)
       $('a[href$=".jpg"], a[href$=".png"], a[href$=".gif"], a[href$=".jpeg"]').each((_, el) => {
@@ -546,16 +597,16 @@ class KhinsiderScraper {
 
       return info;
 
-    } catch (error) {
+    } catch {
       return { images: [], metadata: {} };
     }
   }
 
-  async getAlbumTracks(albumUrl) {
+  async getAlbumTracks(albumUrl: string): Promise<ScrapedTrack[]> {
     try {
       const response = await this.makeRequest(albumUrl);
       const $ = cheerio.load(response.data);
-      const tracks = [];
+      const tracks: ScrapedTrack[] = [];
 
       // Detect if this is a multi-disc album by checking header row
       const headerRow = $('#songlist tr').first();
@@ -617,19 +668,19 @@ class KhinsiderScraper {
 
       return tracks;
 
-    } catch (error) {
+    } catch {
       return [];
     }
   }
 
-  async getTrackDirectUrl(trackPageUrl) {
+  async getTrackDirectUrl(trackPageUrl: string): Promise<TrackUrls> {
     try {
       const response = await this.makeRequest(trackPageUrl);
       const $ = cheerio.load(response.data);
 
       // Look for various types of download links
-      let mp3Url = null;
-      let flacUrl = null;
+      let mp3Url: string | null = null;
+      let flacUrl: string | null = null;
 
       // Method 1: Look for audio source tags
       const audioSource = $('audio source').attr('src');
@@ -670,24 +721,23 @@ class KhinsiderScraper {
         flac: flacUrl
       };
 
-    } catch (error) {
+    } catch {
       return { mp3: null, flac: null };
     }
   }
 
-  async getYears() {
+  async getYears(): Promise<string[]> {
     try {
       const response = await this.makeRequest(`${this.baseUrl}/album-years`);
       const $ = cheerio.load(response.data);
-      const years = [];
+      const years: string[] = [];
 
       // Find year links on the page
       $('a[href*="/game-soundtracks/year/"]').each((_, element) => {
         const $link = $(element);
         const href = $link.attr('href');
-        const text = $link.text().trim();
 
-        // Extract year from href or text
+        // Extract year from href
         const yearMatch = href.match(/\/year\/(\d{4})\/?$/);
         if (yearMatch) {
           const year = yearMatch[1];
@@ -706,14 +756,14 @@ class KhinsiderScraper {
 
       return years;
 
-    } catch (error) {
+    } catch {
       return [];
     }
   }
 
-  async getAlbumsByYear(year) {
+  async getAlbumsByYear(year: string): Promise<Array<{ title: string; url: string; platform: string; year: string }>> {
     try {
-      const albums = [];
+      const albums: Array<{ title: string; url: string; platform: string; year: string }> = [];
       let page = 1;
 
       while (true) {
@@ -723,7 +773,7 @@ class KhinsiderScraper {
 
         const response = await this.makeRequest(url);
         const $ = cheerio.load(response.data);
-        const pageAlbums = [];
+        const pageAlbums: Array<{ title: string; url: string; platform: string; year: string }> = [];
 
         // Try both tbody tr and direct tr (different page structures)
         $('table.albumList tr').each((index, element) => {
@@ -735,7 +785,7 @@ class KhinsiderScraper {
 
           const albumLinks = $row.find('a[href*="/game-soundtracks/album/"]');
 
-          let bestLink = null;
+          let bestLink: cheerio.Cheerio<Element> | null = null;
           let bestTitle = '';
 
           albumLinks.each((i, link) => {
@@ -789,16 +839,16 @@ class KhinsiderScraper {
 
       return albums;
 
-    } catch (error) {
+    } catch {
       return [];
     }
   }
 
-  async getRecentAlbums() {
+  async getRecentAlbums(): Promise<Array<{ title: string; url: string }>> {
     try {
       const response = await this.makeRequest(this.baseUrl);
       const $ = cheerio.load(response.data);
-      const albums = [];
+      const albums: Array<{ title: string; url: string }> = [];
       
       // Look for recent albums on homepage
       $('.latestalbums a[href*="/game-soundtracks/album/"], .albumList a[href*="/game-soundtracks/album/"]').each((_, element) => {
@@ -815,7 +865,7 @@ class KhinsiderScraper {
 
       return albums.slice(0, 20);
 
-    } catch (error) {
+    } catch {
       return [];
     }
   }

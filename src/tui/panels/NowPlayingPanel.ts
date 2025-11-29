@@ -1,9 +1,38 @@
 import blessed from 'blessed';
 import { formatDuration, truncate } from '../utils/formatters.js';
 import { PlaybackState } from '../../constants.js';
+import type { Track, Album, AlbumInfo } from '../../types/index.js';
+
+interface NowPlayingUpdateData {
+  track?: Track | null;
+  album?: Album | null;
+  trackIndex?: number;
+  totalTracks?: number;
+  albumIndex?: number;
+  totalAlbums?: number;
+  state?: string;
+  year?: string | null;
+}
 
 export class NowPlayingPanel {
-  constructor(screen) {
+  screen: blessed.Widgets.Screen;
+  currentTrack: Track | null;
+  currentAlbum: Album | null;
+  trackIndex: number;
+  totalTracks: number;
+  albumIndex: number;
+  totalAlbums: number;
+  state: string;
+  year: string | null;
+  isFavorite: boolean;
+  isDownloaded: boolean;
+  albumMeta: AlbumInfo | null;
+  imagesExpanded: boolean;
+  box: blessed.Widgets.BoxElement;
+  trackInfo: blessed.Widgets.BoxElement;
+  albumInfo: blessed.Widgets.BoxElement;
+
+  constructor(screen: blessed.Widgets.Screen) {
     this.screen = screen;
     this.currentTrack = null;
     this.currentAlbum = null;
@@ -17,6 +46,11 @@ export class NowPlayingPanel {
     this.isDownloaded = false;
     this.albumMeta = null;  // { images: [], metadata: {} }
     this.imagesExpanded = false;  // Folding state for images
+
+    // Initialize UI elements (assigned in createPanel)
+    this.box = null!;
+    this.trackInfo = null!;
+    this.albumInfo = null!;
 
     this.createPanel();
   }
@@ -146,7 +180,7 @@ export class NowPlayingPanel {
     }
   }
 
-  update(data) {
+  update(data: NowPlayingUpdateData): void {
     if (data.track !== undefined) this.currentTrack = data.track;
     if (data.album !== undefined) this.currentAlbum = data.album;
     if (data.trackIndex !== undefined) this.trackIndex = data.trackIndex;
@@ -159,7 +193,7 @@ export class NowPlayingPanel {
     this.render();
   }
 
-  setPlaying(track, album, trackIndex, totalTracks) {
+  setPlaying(track: Track | null, album: Album | null, trackIndex: number, totalTracks: number): void {
     this.update({
       track,
       album,
@@ -188,11 +222,11 @@ export class NowPlayingPanel {
     });
   }
 
-  setError(message) {
+  setError(_message: string) {
     this.update({ state: PlaybackState.ERROR });
   }
 
-  setAlbum(album) {
+  setAlbum(album: Album | null): void {
     if (!album) {
       this.currentAlbum = null;
       this.isFavorite = false;
@@ -200,18 +234,18 @@ export class NowPlayingPanel {
       this.albumMeta = null;
     } else {
       this.currentAlbum = album;
-      this.isFavorite = album.is_favorite || false;
-      this.isDownloaded = album.is_downloaded || false;
+      this.isFavorite = Boolean(album.is_favorite);
+      this.isDownloaded = Boolean(album.is_downloaded);
     }
     this.render();
   }
 
-  setAlbumInfo(info) {
+  setAlbumInfo(info: AlbumInfo | null): void {
     this.albumMeta = info;
     this.render();
   }
 
-  setFavorite(isFavorite) {
+  setFavorite(isFavorite: boolean): void {
     this.isFavorite = isFavorite;
     this.render();
   }

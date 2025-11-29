@@ -2,26 +2,38 @@ import path from 'path';
 import fs from 'fs-extra';
 import { PROJECT_ROOT } from '../data/database.js';
 import { slugify, sanitizeFilename } from '../utils/index.js';
+import type { AlbumMetadata } from '../types/index.js';
 
 const DOWNLOADS_DIR = path.join(PROJECT_ROOT, 'downloads');
 
 // Validate path component to prevent path traversal attacks
-function validatePathComponent(component, name = 'path component') {
-  if (!component || typeof component !== 'string') {
+function validatePathComponent(component: unknown, name = 'path component'): string {
+  if (component === null || component === undefined || typeof component !== 'string') {
     throw new Error(`Invalid ${name}: must be a non-empty string`);
   }
+
+  // Trim whitespace and check for empty string
+  const trimmed = component.trim();
+  if (trimmed.length === 0) {
+    throw new Error(`Invalid ${name}: must be a non-empty string`);
+  }
+
   // Block path traversal patterns
-  if (component.includes('..') || component.includes('/') || component.includes('\\')) {
+  if (trimmed.includes('..') || trimmed.includes('/') || trimmed.includes('\\')) {
     throw new Error(`Invalid ${name}: contains path traversal characters`);
   }
+
   // Block null bytes
-  if (component.includes('\0')) {
+  if (trimmed.includes('\0')) {
     throw new Error(`Invalid ${name}: contains null bytes`);
   }
-  return component;
+
+  return trimmed;
 }
 
 export class StorageManager {
+  downloadsDir: string;
+
   constructor() {
     this.downloadsDir = DOWNLOADS_DIR;
   }
@@ -30,54 +42,54 @@ export class StorageManager {
     await fs.ensureDir(this.downloadsDir);
   }
 
-  getAlbumPath(year, albumSlug) {
+  getAlbumPath(year: string | null, albumSlug: string): string {
     const yearDir = year || 'unknown';
     validatePathComponent(yearDir, 'year');
     validatePathComponent(albumSlug, 'albumSlug');
     return path.join(this.downloadsDir, yearDir, albumSlug);
   }
 
-  getTracksPath(year, albumSlug) {
+  getTracksPath(year: string | null, albumSlug: string): string {
     return path.join(this.getAlbumPath(year, albumSlug), 'tracks');
   }
 
-  getImagesPath(year, albumSlug) {
+  getImagesPath(year: string | null, albumSlug: string): string {
     return path.join(this.getAlbumPath(year, albumSlug), 'images');
   }
 
-  getCoverPath(year, albumSlug) {
+  getCoverPath(year: string | null, albumSlug: string): string {
     return path.join(this.getAlbumPath(year, albumSlug), 'cover.jpg');
   }
 
-  getMetadataPath(year, albumSlug) {
+  getMetadataPath(year: string | null, albumSlug: string): string {
     return path.join(this.getAlbumPath(year, albumSlug), 'metadata.json');
   }
 
-  getZipPath(year, albumSlug) {
+  getZipPath(year: string | null, albumSlug: string): string {
     const yearDir = year || 'unknown';
     validatePathComponent(yearDir, 'year');
     validatePathComponent(albumSlug, 'albumSlug');
     return path.join(this.downloadsDir, yearDir, `${albumSlug}.zip`);
   }
 
-  getTrackFilename(trackNumber, trackName, extension = 'mp3') {
+  getTrackFilename(trackNumber: number, trackName: string, extension = 'mp3'): string {
     const paddedNumber = String(trackNumber).padStart(2, '0');
     const safeName = slugify(trackName);
     return `${paddedNumber}-${safeName}.${extension}`;
   }
 
-  getTrackPath(year, albumSlug, trackNumber, trackName, extension = 'mp3') {
+  getTrackPath(year: string | null, albumSlug: string, trackNumber: number, trackName: string, extension = 'mp3'): string {
     const filename = this.getTrackFilename(trackNumber, trackName, extension);
     return path.join(this.getTracksPath(year, albumSlug), filename);
   }
 
-  async createAlbumDirectory(year, albumSlug) {
+  async createAlbumDirectory(year: string | null, albumSlug: string): Promise<string> {
     const albumPath = this.getAlbumPath(year, albumSlug);
     await fs.ensureDir(albumPath);
     return albumPath;
   }
 
-  async saveMetadata(year, albumSlug, metadata, filename = null) {
+  async saveMetadata(year: string | null, albumSlug: string, metadata: AlbumMetadata, filename: string | null = null): Promise<string> {
     let metadataPath;
     if (filename) {
       validatePathComponent(filename, 'filename');
@@ -89,25 +101,26 @@ export class StorageManager {
     return metadataPath;
   }
 
-  async loadMetadata(year, albumSlug) {
+  async loadMetadata(year: string | null, albumSlug: string): Promise<AlbumMetadata | null> {
     const metadataPath = this.getMetadataPath(year, albumSlug);
     if (await fs.pathExists(metadataPath)) {
       try {
-        return await fs.readJson(metadataPath);
-      } catch (error) {
+        return await fs.readJson(metadataPath) as AlbumMetadata;
+      } catch (error: unknown) {
         // Return null if JSON is malformed
-        console.error(`Failed to parse metadata at ${metadataPath}:`, error.message);
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Failed to parse metadata at ${metadataPath}:`, message);
         return null;
       }
     }
     return null;
   }
 
-  async fileExists(filePath) {
+  async fileExists(filePath: string): Promise<boolean> {
     return await fs.pathExists(filePath);
   }
 
-  async getFileSize(filePath) {
+  async getFileSize(filePath: string): Promise<number> {
     try {
       const stats = await fs.stat(filePath);
       return stats.size;
@@ -116,7 +129,7 @@ export class StorageManager {
     }
   }
 
-  async deleteAlbum(year, albumSlug) {
+  async deleteAlbum(year: string | null, albumSlug: string): Promise<boolean> {
     const albumPath = this.getAlbumPath(year, albumSlug);
     if (await fs.pathExists(albumPath)) {
       await fs.remove(albumPath);
@@ -135,7 +148,7 @@ export class StorageManager {
       .sort((a, b) => b.localeCompare(a));
   }
 
-  async getDownloadedAlbums(year) {
+  async getDownloadedAlbums(year: string): Promise<string[]> {
     validatePathComponent(year, 'year');
     const yearPath = path.join(this.downloadsDir, year);
     if (!await fs.pathExists(yearPath)) {
@@ -150,27 +163,40 @@ export class StorageManager {
     let albumCount = 0;
     let trackCount = 0;
 
-    const years = await this.getDownloadedYears();
-    for (const year of years) {
-      const albums = await this.getDownloadedAlbums(year);
-      albumCount += albums.length;
+    try {
+      const years = await this.getDownloadedYears();
+      for (const year of years) {
+        try {
+          const albums = await this.getDownloadedAlbums(year);
+          albumCount += albums.length;
 
-      for (const album of albums) {
-        const tracksPath = this.getTracksPath(year, album);
-        if (await fs.pathExists(tracksPath)) {
-          const tracks = await fs.readdir(tracksPath);
-          trackCount += tracks.filter(t => t.endsWith('.mp3') || t.endsWith('.flac')).length;
+          for (const album of albums) {
+            try {
+              const tracksPath = this.getTracksPath(year, album);
+              if (await fs.pathExists(tracksPath)) {
+                const tracks = await fs.readdir(tracksPath);
+                trackCount += tracks.filter(t => t.endsWith('.mp3') || t.endsWith('.flac')).length;
 
-          for (const track of tracks) {
-            totalSize += await this.getFileSize(path.join(tracksPath, track));
+                for (const track of tracks) {
+                  // getFileSize already handles errors and returns 0
+                  totalSize += await this.getFileSize(path.join(tracksPath, track));
+                }
+              }
+
+              const coverPath = this.getCoverPath(year, album);
+              if (await fs.pathExists(coverPath)) {
+                totalSize += await this.getFileSize(coverPath);
+              }
+            } catch {
+              // Skip albums that can't be read (deleted mid-scan, permission issues)
+            }
           }
-        }
-
-        const coverPath = this.getCoverPath(year, album);
-        if (await fs.pathExists(coverPath)) {
-          totalSize += await this.getFileSize(coverPath);
+        } catch {
+          // Skip years that can't be read
         }
       }
+    } catch {
+      // If we can't read years at all, return zero stats
     }
 
     return {

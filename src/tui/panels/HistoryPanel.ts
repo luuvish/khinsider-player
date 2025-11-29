@@ -1,11 +1,32 @@
 import blessed from 'blessed';
 
+interface HistoryPanelOptions {
+  maxHistory?: number;
+}
+
+interface HistoryEntry {
+  time: string;
+  type: string;
+  message: string;
+  formatted: string;
+}
+
 export class HistoryPanel {
-  constructor(screen, options = {}) {
+  screen: blessed.Widgets.Screen;
+  maxHistory: number;
+  history: HistoryEntry[];
+  box: blessed.Widgets.BoxElement;
+  log: blessed.Widgets.Log;
+
+  constructor(screen: blessed.Widgets.Screen, options: HistoryPanelOptions = {}) {
     this.screen = screen;
     this.maxHistory = options.maxHistory || 100;
 
     this.history = [];
+
+    // Initialize UI elements (assigned in createPanel)
+    this.box = null!;
+    this.log = null!;
 
     this.createPanel();
   }
@@ -63,7 +84,7 @@ export class HistoryPanel {
     return `${h}:${m}:${s}`;
   }
 
-  addEntry(type, message) {
+  addEntry(type: string, message: string): void {
     const time = this.formatTime();
     let prefix = '';
     let color = 'white';
@@ -121,31 +142,31 @@ export class HistoryPanel {
   }
 
   // Convenience methods
-  logPlay(message) {
+  logPlay(message: string): void {
     this.addEntry('play', message);
   }
 
-  logPause(message) {
+  logPause(message: string): void {
     this.addEntry('pause', message);
   }
 
-  logStop(message) {
+  logStop(message: string): void {
     this.addEntry('stop', message);
   }
 
-  logDownload(message) {
+  logDownload(message: string): void {
     this.addEntry('download', message);
   }
 
-  logFavorite(message) {
+  logFavorite(message: string): void {
     this.addEntry('favorite', message);
   }
 
-  logError(message) {
+  logError(message: string): void {
     this.addEntry('error', message);
   }
 
-  logInfo(message) {
+  logInfo(message: string): void {
     this.addEntry('info', message);
   }
 

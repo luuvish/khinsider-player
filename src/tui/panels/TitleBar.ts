@@ -1,10 +1,23 @@
 import blessed from 'blessed';
 
 export class TitleBar {
-  constructor(screen) {
+  screen: blessed.Widgets.Screen;
+  isLoggedIn: boolean;
+  username: string;
+  box: blessed.Widgets.BoxElement;
+  leftBox: blessed.Widgets.BoxElement;
+  rightBox: blessed.Widgets.BoxElement;
+
+  constructor(screen: blessed.Widgets.Screen) {
     this.screen = screen;
     this.isLoggedIn = false;
     this.username = '';
+
+    // Initialize UI elements (assigned in createPanel)
+    this.box = null!;
+    this.leftBox = null!;
+    this.rightBox = null!;
+
     this.createPanel();
   }
 
@@ -62,7 +75,7 @@ export class TitleBar {
     }
   }
 
-  setLoginStatus(isLoggedIn, username = '') {
+  setLoginStatus(isLoggedIn: boolean, username = ''): void {
     this.isLoggedIn = isLoggedIn;
     this.username = username;
     this.rightBox.setContent(this.getRightContent());
