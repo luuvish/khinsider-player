@@ -2,6 +2,9 @@ import { useState, useEffect, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { albumsApi } from '@/api/client';
 import { logger } from '@/utils/logger';
+import { AlbumCard } from '@/components/features';
+import { Button, Skeleton } from '@/components/ui';
+import { ArrowLeft, RefreshCw, AlertCircle } from '@/lib/icons';
 
 interface Album {
   id: number;
@@ -13,12 +16,14 @@ interface Album {
   isFavorite: boolean;
   isDownloaded: boolean;
   slug: string;
+  cover_url?: string;
 }
 
 export function YearPage() {
   const { year } = useParams<{ year: string }>();
   const [albums, setAlbums] = useState<Album[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -28,13 +33,11 @@ export function YearPage() {
     }
 
     return () => {
-      // Cleanup: abort pending request on unmount
       abortControllerRef.current?.abort();
     };
   }, [year]);
 
   const loadAlbums = async () => {
-    // Abort any existing request
     abortControllerRef.current?.abort();
     abortControllerRef.current = new AbortController();
 
@@ -43,7 +46,6 @@ export function YearPage() {
       const { data } = await albumsApi.getByYear(year!, false, abortControllerRef.current.signal);
       setAlbums(data.albums);
     } catch (err) {
-      // Don't set error for aborted requests
       if (err instanceof Error && err.name === 'CanceledError') {
         return;
       }
@@ -55,78 +57,115 @@ export function YearPage() {
   };
 
   const handleRefresh = async () => {
-    // Abort any existing request
     abortControllerRef.current?.abort();
     abortControllerRef.current = new AbortController();
 
     try {
-      setIsLoading(true);
+      setIsRefreshing(true);
       const { data } = await albumsApi.getByYear(year!, true, abortControllerRef.current.signal);
       setAlbums(data.albums);
     } catch (err) {
-      // Don't set error for aborted requests
       if (err instanceof Error && err.name === 'CanceledError') {
         return;
       }
       setError('Failed to refresh albums');
     } finally {
-      setIsLoading(false);
+      setIsRefreshing(false);
     }
   };
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-slate-400">Loading albums...</div>
+      <div className="py-8">
+        <div className="flex items-center gap-4 mb-8">
+          <Skeleton className="h-6 w-16" />
+          <Skeleton className="h-8 w-48" />
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+          {Array.from({ length: 15 }).map((_, i) => (
+            <div key={i} className="space-y-3">
+              <Skeleton className="aspect-square rounded-lg" />
+              <Skeleton className="h-4 w-3/4" />
+              <Skeleton className="h-3 w-1/2" />
+            </div>
+          ))}
+        </div>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-red-400">{error}</div>
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <AlertCircle className="w-12 h-12 text-error mb-4" />
+        <p className="text-lg text-neutral-200 mb-2">Unable to load albums</p>
+        <p className="text-sm text-neutral-500">{error}</p>
+        <button
+          onClick={loadAlbums}
+          className="mt-4 px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm transition-colors"
+        >
+          Try again
+        </button>
       </div>
     );
   }
 
   return (
-    <div className="p-6">
-      <div className="flex items-center justify-between mb-6">
+    <section className="py-8 animate-fade-in">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-8">
         <div className="flex items-center gap-4">
-          <Link to="/" className="text-slate-400 hover:text-white">
-            &larr; Back
+          <Link
+            to="/"
+            className="text-neutral-400 hover:text-neutral-100 transition-colors"
+          >
+            <ArrowLeft className="w-5 h-5" />
           </Link>
-          <h1 className="text-2xl font-bold">Albums from {year}</h1>
-          <span className="text-slate-400">({albums.length} albums)</span>
+          <div>
+            <h1 className="text-2xl font-semibold text-neutral-100">
+              Albums from {year}
+            </h1>
+            <p className="text-sm text-neutral-400 mt-1">
+              {albums.length} {albums.length === 1 ? 'album' : 'albums'}
+            </p>
+          </div>
         </div>
-        <button onClick={handleRefresh} className="btn btn-secondary">
+
+        <Button
+          variant="secondary"
+          icon={RefreshCw}
+          onClick={handleRefresh}
+          loading={isRefreshing}
+        >
           Refresh
-        </button>
+        </Button>
       </div>
 
-      <div className="grid gap-2">
-        {albums.map((album) => (
-          <Link
-            key={album.id}
-            to={`/album/${album.id}`}
-            className="card p-4 hover:bg-slate-700/50 transition-colors flex items-center gap-4"
-          >
-            <div className="flex-1 min-w-0">
-              <div className="font-medium truncate">{album.title}</div>
-              <div className="text-sm text-slate-400">{album.platform}</div>
-            </div>
-            <div className="flex items-center gap-4 text-sm text-slate-400">
-              {album.isFavorite && (
-                <svg className="w-5 h-5 text-yellow-500" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z" />
-                </svg>
-              )}
-              <span>{album.trackCount || '-'} tracks</span>
-            </div>
-          </Link>
-        ))}
-      </div>
-    </div>
+      {/* Albums Grid */}
+      {albums.length === 0 ? (
+        <div className="py-12 text-center">
+          <p className="text-neutral-400">No albums found for {year}</p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+          {albums.map((album) => (
+            <AlbumCard
+              key={album.id}
+              album={{
+                id: album.id,
+                slug: album.slug,
+                title: album.title,
+                year: album.year,
+                platform: album.platform,
+                track_count: album.trackCount,
+                is_favorite: album.isFavorite,
+                is_downloaded: album.isDownloaded,
+                cover_url: album.cover_url,
+              }}
+            />
+          ))}
+        </div>
+      )}
+    </section>
   );
 }

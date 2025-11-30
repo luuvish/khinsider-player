@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
-import { Link } from 'react-router-dom';
 import { albumsApi } from '@/api/client';
 import { logger } from '@/utils/logger';
+import { YearCard } from '@/components/features';
+import { Skeleton } from '@/components/ui';
+import { AlertCircle } from '@/lib/icons';
 
 interface YearInfo {
   year: string;
@@ -18,13 +20,11 @@ export function HomePage() {
     loadYears();
 
     return () => {
-      // Cleanup: abort pending request on unmount
       abortControllerRef.current?.abort();
     };
   }, []);
 
   const loadYears = async () => {
-    // Abort any existing request
     abortControllerRef.current?.abort();
     abortControllerRef.current = new AbortController();
 
@@ -33,7 +33,6 @@ export function HomePage() {
       const { data } = await albumsApi.getYears(abortControllerRef.current.signal);
       setYears(data.years);
     } catch (err) {
-      // Don't set error for aborted requests
       if (err instanceof Error && err.name === 'CanceledError') {
         return;
       }
@@ -46,40 +45,48 @@ export function HomePage() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-slate-400">Loading...</div>
+      <div className="py-12">
+        <Skeleton className="h-8 w-48 mb-8" />
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+          {Array.from({ length: 20 }).map((_, i) => (
+            <Skeleton key={i} className="h-24 rounded-xl" />
+          ))}
+        </div>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-red-400">{error}</div>
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <AlertCircle className="w-12 h-12 text-error mb-4" />
+        <p className="text-lg text-neutral-200 mb-2">Unable to load years</p>
+        <p className="text-sm text-neutral-500">{error}</p>
+        <button
+          onClick={loadYears}
+          className="mt-4 px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm transition-colors"
+        >
+          Try again
+        </button>
       </div>
     );
   }
 
   return (
-    <div className="p-6">
-      <h1 className="text-2xl font-bold mb-6">Browse by Year</h1>
+    <section className="py-12 animate-fade-in">
+      <h1 className="text-2xl font-semibold text-neutral-100 mb-8">
+        Browse by Year
+      </h1>
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
         {years.map((yearInfo) => (
-          <Link
+          <YearCard
             key={yearInfo.year}
-            to={`/year/${yearInfo.year}`}
-            className="card p-4 hover:bg-slate-700/50 transition-colors"
-          >
-            <div className="text-xl font-bold text-primary-400">
-              {yearInfo.year}
-            </div>
-            <div className="text-sm text-slate-400">
-              {yearInfo.albumCount} albums
-            </div>
-          </Link>
+            year={yearInfo.year}
+            albumCount={yearInfo.albumCount}
+          />
         ))}
       </div>
-    </div>
+    </section>
   );
 }

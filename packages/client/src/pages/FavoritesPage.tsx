@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
-import { Link } from 'react-router-dom';
 import { albumsApi } from '@/api/client';
 import { logger } from '@/utils/logger';
+import { AlbumCard } from '@/components/features';
+import { Skeleton } from '@/components/ui';
+import { Star, AlertCircle } from '@/lib/icons';
 
 interface Album {
   id: number;
@@ -13,6 +15,7 @@ interface Album {
   isFavorite: boolean;
   isDownloaded: boolean;
   slug: string;
+  cover_url?: string;
 }
 
 export function FavoritesPage() {
@@ -25,13 +28,11 @@ export function FavoritesPage() {
     loadFavorites();
 
     return () => {
-      // Cleanup: abort pending request on unmount
       abortControllerRef.current?.abort();
     };
   }, []);
 
   const loadFavorites = async () => {
-    // Abort any existing request
     abortControllerRef.current?.abort();
     abortControllerRef.current = new AbortController();
 
@@ -40,7 +41,6 @@ export function FavoritesPage() {
       const { data } = await albumsApi.getFavorites(abortControllerRef.current.signal);
       setAlbums(data.albums);
     } catch (err) {
-      // Don't set error for aborted requests
       if (err instanceof Error && err.name === 'CanceledError') {
         return;
       }
@@ -53,53 +53,88 @@ export function FavoritesPage() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-slate-400">Loading favorites...</div>
+      <div className="py-8 sm:py-12">
+        <div className="flex items-center gap-3 mb-8">
+          <Skeleton className="h-8 w-8 rounded-full" />
+          <Skeleton className="h-8 w-48" />
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+          {Array.from({ length: 10 }).map((_, i) => (
+            <div key={i} className="space-y-3">
+              <Skeleton className="aspect-square rounded-lg" />
+              <Skeleton className="h-4 w-3/4" />
+              <Skeleton className="h-3 w-1/2" />
+            </div>
+          ))}
+        </div>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-red-400">{error}</div>
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <AlertCircle className="w-12 h-12 text-error mb-4" />
+        <p className="text-lg text-neutral-200 mb-2">Unable to load favorites</p>
+        <p className="text-sm text-neutral-500">{error}</p>
+        <button
+          onClick={loadFavorites}
+          className="mt-4 px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm transition-colors"
+        >
+          Try again
+        </button>
       </div>
     );
   }
 
   return (
-    <div className="p-6">
-      <h1 className="text-2xl font-bold mb-6">Favorites</h1>
+    <section className="py-8 sm:py-12 animate-fade-in">
+      {/* Header */}
+      <div className="flex items-center gap-3 mb-8">
+        <div className="p-2 rounded-full bg-warning/10">
+          <Star className="w-5 h-5 text-warning fill-current" />
+        </div>
+        <div>
+          <h1 className="text-2xl font-semibold text-neutral-100">
+            Favorites
+          </h1>
+          <p className="text-sm text-neutral-400">
+            {albums.length} {albums.length === 1 ? 'album' : 'albums'}
+          </p>
+        </div>
+      </div>
 
+      {/* Albums Grid */}
       {albums.length === 0 ? (
-        <div className="text-center text-slate-400 py-12">
-          <p>No favorite albums yet.</p>
-          <p className="mt-2">Browse albums and click the star to add favorites.</p>
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <div className="p-4 rounded-full bg-neutral-800/50 mb-4">
+            <Star className="w-12 h-12 text-neutral-700" />
+          </div>
+          <p className="text-lg text-neutral-300 mb-2">No favorites yet</p>
+          <p className="text-sm text-neutral-500 max-w-sm">
+            Browse albums and click the star icon to add them to your favorites
+          </p>
         </div>
       ) : (
-        <div className="grid gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
           {albums.map((album) => (
-            <Link
+            <AlbumCard
               key={album.id}
-              to={`/album/${album.id}`}
-              className="card p-4 hover:bg-slate-700/50 transition-colors flex items-center gap-4"
-            >
-              <svg className="w-5 h-5 text-yellow-500" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z" />
-              </svg>
-              <div className="flex-1 min-w-0">
-                <div className="font-medium truncate">{album.title}</div>
-                <div className="text-sm text-slate-400">
-                  {album.platform} - {album.year}
-                </div>
-              </div>
-              <div className="text-sm text-slate-400">
-                {album.trackCount || '-'} tracks
-              </div>
-            </Link>
+              album={{
+                id: album.id,
+                slug: album.slug,
+                title: album.title,
+                year: album.year,
+                platform: album.platform,
+                track_count: album.trackCount,
+                is_favorite: album.isFavorite,
+                is_downloaded: album.isDownloaded,
+                cover_url: album.cover_url,
+              }}
+            />
           ))}
         </div>
       )}
-    </div>
+    </section>
   );
 }

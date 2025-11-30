@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { albumsApi } from '@/api/client';
-import { TrackList } from '@/components/TrackList';
+import { usePlayerStore } from '@/stores/playerStore';
+import { TrackList, FavoriteButton } from '@/components/features';
+import { Button, Badge, Skeleton } from '@/components/ui';
+import { ArrowLeft, Play, RefreshCw, AlertCircle, Disc } from '@/lib/icons';
 import { logger } from '@/utils/logger';
 
-// Validation constants
-const MAX_ALBUM_ID = 2147483647; // Max SQLite integer
+const MAX_ALBUM_ID = 2147483647;
 
 interface Album {
   id: number;
@@ -17,6 +19,7 @@ interface Album {
   isFavorite: boolean;
   isDownloaded: boolean;
   slug: string;
+  cover_url?: string;
 }
 
 interface Track {
@@ -35,9 +38,11 @@ export function AlbumPage() {
   const [album, setAlbum] = useState<Album | null>(null);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Validate and parse album ID
+  const { currentTrack, isPlaying, play } = usePlayerStore();
+
   const getValidAlbumId = useCallback((): number | null => {
     if (!id) return null;
     const albumId = parseInt(id, 10);
@@ -64,13 +69,11 @@ export function AlbumPage() {
         albumsApi.getTracks(albumId)
       ]);
 
-      // Check if request was aborted
       if (signal.aborted) return;
 
       setAlbum(albumRes.data.album);
       setTracks(tracksRes.data.tracks);
     } catch (err) {
-      // Don't update state if aborted
       if (signal.aborted) return;
       const message = err instanceof Error ? err.message : 'Unknown error';
       setError(`Failed to load album: ${message}`);
@@ -98,14 +101,14 @@ export function AlbumPage() {
     if (!albumId) return;
 
     try {
-      setIsLoading(true);
+      setIsRefreshing(true);
       const { data } = await albumsApi.getTracks(albumId, true);
       setTracks(data.tracks);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
       setError(`Failed to refresh tracks: ${message}`);
     } finally {
-      setIsLoading(false);
+      setIsRefreshing(false);
     }
   };
 
@@ -119,66 +122,149 @@ export function AlbumPage() {
     }
   };
 
+  const handlePlayAll = () => {
+    if (!album || tracks.length === 0) return;
+    play(tracks[0], album, tracks);
+  };
+
+  const handleTrackSelect = (track: Track) => {
+    if (!album) return;
+    play(track, album, tracks);
+  };
+
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-slate-400">Loading album...</div>
+      <div className="py-8 sm:py-12">
+        <Skeleton className="h-5 w-32 mb-6" />
+        <div className="flex flex-col sm:flex-row gap-6 sm:gap-8 mb-8">
+          <Skeleton className="w-48 h-48 sm:w-56 sm:h-56 rounded-xl mx-auto sm:mx-0" />
+          <div className="flex-1 space-y-4 text-center sm:text-left">
+            <Skeleton className="h-8 w-3/4 mx-auto sm:mx-0" />
+            <div className="flex gap-2 justify-center sm:justify-start">
+              <Skeleton className="h-6 w-20" />
+              <Skeleton className="h-6 w-16" />
+            </div>
+            <div className="flex gap-3 justify-center sm:justify-start">
+              <Skeleton className="h-10 w-28" />
+              <Skeleton className="h-10 w-10 rounded-full" />
+            </div>
+          </div>
+        </div>
+        <div className="space-y-3">
+          {Array.from({ length: 8 }).map((_, i) => (
+            <Skeleton key={i} className="h-14" />
+          ))}
+        </div>
       </div>
     );
   }
 
   if (error || !album) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-red-400">{error || 'Album not found'}</div>
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <AlertCircle className="w-12 h-12 text-error mb-4" />
+        <p className="text-lg text-neutral-200 mb-2">Unable to load album</p>
+        <p className="text-sm text-neutral-500">{error || 'Album not found'}</p>
+        <Link
+          to="/"
+          className="mt-4 px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm transition-colors"
+        >
+          Go back home
+        </Link>
       </div>
     );
   }
 
   return (
-    <div className="p-6 pb-32">
-      <div className="mb-6">
-        <Link to={`/year/${album.year}`} className="text-slate-400 hover:text-white">
-          &larr; Back to {album.year}
+    <section className="py-8 sm:py-12 animate-fade-in">
+      {/* Back Link */}
+      <nav className="mb-6">
+        <Link
+          to={`/year/${album.year}`}
+          className="inline-flex items-center gap-2 text-sm text-neutral-400 hover:text-neutral-200 transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Back to {album.year}
         </Link>
-      </div>
+      </nav>
 
-      <div className="card p-6 mb-6">
-        <div className="flex items-start justify-between">
-          <div>
-            <h1 className="text-2xl font-bold mb-2">{album.title}</h1>
-            <div className="flex items-center gap-4 text-slate-400">
-              <span>{album.platform}</span>
-              <span>{album.year}</span>
-              <span>{tracks.length} tracks</span>
+      {/* Album Header */}
+      <header className="mb-8 sm:mb-12">
+        <div className="flex flex-col sm:flex-row gap-6 sm:gap-8">
+          {/* Album Art */}
+          <div className="w-48 h-48 sm:w-56 sm:h-56 rounded-xl bg-neutral-800 flex items-center justify-center flex-shrink-0 mx-auto sm:mx-0 overflow-hidden">
+            {album.cover_url ? (
+              <img
+                src={album.cover_url}
+                alt={album.title}
+                className="w-full h-full object-cover"
+              />
+            ) : (
+              <Disc className="w-16 h-16 text-neutral-700" />
+            )}
+          </div>
+
+          {/* Album Info */}
+          <div className="flex-1 text-center sm:text-left">
+            <h1 className="text-2xl sm:text-3xl font-semibold text-neutral-100">
+              {album.title}
+            </h1>
+
+            <div className="mt-3 flex flex-wrap justify-center sm:justify-start gap-3">
+              <Badge>{album.platform}</Badge>
+              <Badge>{album.year}</Badge>
+              <span className="text-sm text-neutral-400">
+                {tracks.length} {tracks.length === 1 ? 'track' : 'tracks'}
+              </span>
+            </div>
+
+            <div className="mt-6 flex flex-wrap justify-center sm:justify-start gap-3">
+              <Button
+                variant="primary"
+                icon={Play}
+                onClick={handlePlayAll}
+                disabled={tracks.length === 0}
+              >
+                Play All
+              </Button>
+
+              <FavoriteButton
+                isFavorite={album.isFavorite}
+                onToggle={handleToggleFavorite}
+                size="md"
+              />
+
+              <Button
+                variant="ghost"
+                icon={RefreshCw}
+                onClick={handleRefreshTracks}
+                loading={isRefreshing}
+              >
+                Refresh
+              </Button>
             </div>
           </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleToggleFavorite}
-              className="p-2 hover:bg-slate-700 rounded-lg transition-colors"
-              title={album.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-            >
-              <svg
-                className={`w-6 h-6 ${album.isFavorite ? 'text-yellow-500' : 'text-slate-400'}`}
-                fill={album.isFavorite ? 'currentColor' : 'none'}
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
-              </svg>
-            </button>
-            <button onClick={handleRefreshTracks} className="btn btn-secondary">
-              Refresh
-            </button>
-          </div>
         </div>
-      </div>
+      </header>
 
-      <div className="card">
-        <TrackList tracks={tracks} album={album} />
-      </div>
-    </div>
+      {/* Track List */}
+      <TrackList
+        tracks={tracks.map((t) => ({
+          id: t.id,
+          name: t.name,
+          track_number: t.trackNumber,
+          duration: t.duration,
+          file_size: t.fileSize,
+        }))}
+        currentTrackId={currentTrack?.id}
+        isPlaying={isPlaying}
+        onTrackSelect={(track) => {
+          const fullTrack = tracks.find((t) => t.id === track.id);
+          if (fullTrack) {
+            handleTrackSelect(fullTrack);
+          }
+        }}
+      />
+    </section>
   );
 }

@@ -37,20 +37,33 @@ process.stdout.write = ((
   return originalStdoutWrite(chunk, encodingOrCallback as BufferEncoding, callback);
 }) as typeof process.stdout.write;
 
+import path from 'path';
+import { fileURLToPath } from 'url';
 import {
   initializeDatabase,
   closeDatabase,
+  configurePaths,
   albumRepo,
   trackRepo,
   KhinsiderScraper,
   createDownloader
 } from '@khinsider/core';
+
+// ESM에서 __dirname 대체
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// 프로젝트 루트 계산 (packages/tui/dist/index.js → 프로젝트 루트)
+const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 import { createPlaybackController } from './playback/controller.js';
 import { audioPlayer } from './playback/player.js';
 import { App } from './tui/App.js';
 
 async function main() {
   try {
+    // Configure database path (must be called before initializeDatabase)
+    configurePaths(PROJECT_ROOT);
+
     // Initialize database
     initializeDatabase();
 

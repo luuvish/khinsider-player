@@ -1,8 +1,9 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { useEffect } from 'react';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
-import { Navbar } from '@/components/Navbar';
-import { Player } from '@/components/Player';
+import { Navbar } from '@/components/layout/Navbar';
+import { Player } from '@/components/player';
+import { Container } from '@/components/ui';
 import { HomePage } from '@/pages/HomePage';
 import { YearPage } from '@/pages/YearPage';
 import { AlbumPage } from '@/pages/AlbumPage';
@@ -19,10 +20,11 @@ function AppContent() {
   }, [checkAuth]);
 
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="min-h-screen bg-neutral-950 text-neutral-100">
       <Navbar />
-      <main className="flex-1">
-        <div className="max-w-6xl mx-auto">
+      <main className="pb-28">
+        {/* pb-28 for player height offset (h-20 desktop + extra padding) */}
+        <Container>
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/year/:year" element={<YearPage />} />
@@ -31,7 +33,7 @@ function AppContent() {
             <Route path="/favorites" element={<FavoritesPage />} />
             <Route path="/login" element={<LoginPage />} />
           </Routes>
-        </div>
+        </Container>
       </main>
       <Player />
     </div>
