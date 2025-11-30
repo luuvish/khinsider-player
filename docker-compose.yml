@@ -1,0 +1,36 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - DATABASE_PATH=/app/data/khinsider.db
+      - CORS_ORIGIN=http://localhost:5173
+    volumes:
+      - server-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: client
+    ports:
+      - "80:80"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  server-data:

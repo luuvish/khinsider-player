@@ -1,56 +1,46 @@
 {
-  "name": "khinsider-player",
+  "name": "khinsider-player-monorepo",
   "version": "2.0.0",
-  "description": "A TUI music player for video game soundtracks from khinsider.com",
-  "main": "dist/index.js",
-  "bin": {
-    "khinsider-player": "dist/index.js"
-  },
+  "private": true,
+  "description": "A music player for video game soundtracks from khinsider.com",
   "type": "module",
   "engines": {
     "node": ">=18.0.0"
   },
-  "files": [
-    "dist"
-  ],
   "author": "luuvish@gmail.com",
   "license": "MIT",
-  "keywords": [
-    "music",
-    "player",
-    "khinsider",
-    "video-game-music",
-    "tui"
-  ],
   "scripts": {
-    "start": "tsx src/index.ts",
-    "dev": "tsx watch src/index.ts",
-    "build": "tsup",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint src",
-    "lint:fix": "eslint src --fix"
-  },
-  "dependencies": {
-    "axios": "^1.6.0",
-    "axios-cookiejar-support": "^6.0.5",
-    "better-sqlite3": "^11.6.0",
-    "blessed": "^0.1.81",
-    "blessed-contrib": "^4.11.0",
-    "chalk": "^5.3.0",
-    "cheerio": "^1.0.0-rc.12",
-    "fs-extra": "^11.2.0",
-    "tough-cookie": "^6.0.0"
+    "dev": "concurrently \"pnpm dev:server\" \"pnpm dev:client\"",
+    "dev:tui": "pnpm --filter @khinsider/tui dev",
+    "dev:server": "pnpm --filter @khinsider/server dev",
+    "dev:client": "pnpm --filter @khinsider/client dev",
+    "start": "node packages/server/dist/index.js",
+    "build": "pnpm -r build",
+    "build:shared": "pnpm --filter @khinsider/shared build",
+    "build:core": "pnpm --filter @khinsider/core build",
+    "build:tui": "pnpm --filter @khinsider/tui build",
+    "build:server": "pnpm --filter @khinsider/server build",
+    "build:client": "pnpm --filter @khinsider/client build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/blessed": "^0.1.26",
-    "@types/fs-extra": "^11.0.4",
     "@types/node": "^24.10.1",
+    "@vitest/coverage-v8": "^4.0.14",
+    "concurrently": "^9.2.1",
     "eslint": "^9.39.1",
     "tsup": "^8.5.1",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.48.0"
+    "typescript-eslint": "^8.48.0",
+    "vitest": "^4.0.14"
   }
 }

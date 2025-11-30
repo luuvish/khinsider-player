@@ -1,0 +1,46 @@
+{
+  "name": "@khinsider/core",
+  "version": "1.0.0",
+  "description": "Core business logic for khinsider player",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./scraper": {
+      "types": "./dist/scraper.d.ts",
+      "import": "./dist/scraper.js"
+    },
+    "./data": {
+      "types": "./dist/data/index.d.ts",
+      "import": "./dist/data/index.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "import": "./dist/storage/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@khinsider/shared": "workspace:*",
+    "axios": "^1.6.0",
+    "axios-cookiejar-support": "^6.0.5",
+    "better-sqlite3": "^11.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "fs-extra": "^11.2.0",
+    "tough-cookie": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/fs-extra": "^11.0.4",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  }
+}

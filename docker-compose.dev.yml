@@ -1,0 +1,22 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - JWT_SECRET=dev-secret-key
+      - DATABASE_PATH=/app/data/khinsider.db
+      - CORS_ORIGIN=http://localhost:5173
+    volumes:
+      - ./packages/shared:/app/packages/shared
+      - ./packages/core:/app/packages/core
+      - ./packages/server:/app/packages/server
+      - server-data:/app/data
+    command: pnpm --filter=@khinsider/server run dev
+
+volumes:
+  server-data:
